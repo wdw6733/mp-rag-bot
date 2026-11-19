@@ -67,9 +67,8 @@ nano .env
 #    ADMIN_TOKEN：POST /admin/reload 的鉴权，随便填一个长随机字符串
 #    LLM_MODEL 想换模型只改这一行，例如 muse-spark（以 AnyRouter 上实际有的模型为准）
 
-# 3. 拉镜像并启动
-docker compose pull
-docker compose up -d
+# 3. 启动（重启即升级：compose 里 pull_policy: always，每次 up -d 都会先拉最新镜像，不用单独 pull）
+docker compose down && docker compose up -d
 
 # 4. 看日志，确认起来了
 docker compose logs -f mp-rag-bot
