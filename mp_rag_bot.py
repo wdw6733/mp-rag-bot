@@ -1,26 +1,34 @@
 #!/usr/bin/env python3
-"""公众号轻量 RAG 机器人 v1.1。
+"""公众号轻量 RAG 机器人 v1.2。
 
 服务号（未微信认证）发文字消息 -> 微信 POST 到 /mp/callback ->
 检索 knowledge/ 里的 Markdown 作参考 -> 调用户自配的大模型综合回答 ->
 5 秒内用被动回复 XML 把答案发回去。
 
-回答模式（v1.1）：大模型是主力，知识库只是参考/ grounding，不是门槛。
+回答模式（v1.1 起）：大模型是主力，知识库只是参考/ grounding，不是门槛。
 检索到相关摘录就把摘录当参考发给大模型；检索不到也照常让大模型
 用通用知识回答，绝不回“知识库里没有”。只有大模型不可用（未配 Key /
 超时 / 报错）时才退回知识库原文摘录；知识库也没有相关内容时，
 回一句简短的“大模型暂时不可用，请稍后再问”。
 
+模型自动选择（v1.2）：LLM_MODEL 留空 = 自动模式（默认）。启动和每次
+需要时调 GET {LLM_API_BASE}/models 发现网关上实际有的模型，按
+快/便宜优先顺序自动挑一个；不同网关（AnyRouter / muse2api / wb）
+的模型名不一样，硬编码一个名字会在别的网关上 400 报错。已配模型
+优先用，400 模型不存在时自动换下一个。LLM_TIMEOUT_SEC 是全部
+尝试的总预算，不是每次尝试的超时。
+
 未认证服务号的限制（v1.1 不做、也做不了）：
 - 只有 5 秒内被动回复，没有 48 小时客服消息；
 - 服务器配置启用后，自定义菜单不可用。
 认证（300 元/年）后才能用客服消息突破 5 秒、才能用自定义菜单，
-那是可选的后续升级，不是 v1.1 的必需项。
+那是可选的后续升级，不是 v1.2 的必需项。
 
 凭证与模型只从环境变量读，绝不写进代码、README、日志。
 模型不固定：LLM_API_BASE / LLM_API_KEY / LLM_MODEL 由用户在 .env 里
 自由配置，改完 docker compose restart 即可，不用改代码、不用重新打镜像。
-日志只记问题长度和命中来源，不记完整 OpenID（只记前 8 位哈希）。
+日志只记问题长度、命中来源和模型名，不记完整 OpenID（只记前 8 位哈希），
+绝不记 Key / Authorization 头。
 """
 import hashlib
 import os
@@ -32,7 +40,7 @@ from flask import Flask, request
 
 from retrieval import KnowledgeIndex
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 PORT = int(os.environ.get("MP_PORT", "18790"))
 KNOWLEDGE_DIR = os.environ.get(
     "KNOWLEDGE_DIR",
@@ -43,9 +51,20 @@ MP_TOKEN = os.environ.get("MP_TOKEN", "").strip()
 # 本来也用不了），不要在 .env 里配这两个。
 LLM_API_BASE = os.environ.get("LLM_API_BASE", "https://anyrouter.top/v1").strip() or "https://anyrouter.top/v1"
 LLM_API_KEY = os.environ.get("LLM_API_KEY", "").strip()
-# 模型不固定：只在 .env 为空时 fallback 到 deepseek-chat，.env.example 里
-# LLM_MODEL 本来就是空的，配什么模型以用户的 .env 为准。
-LLM_MODEL = os.environ.get("LLM_MODEL", "").strip() or "deepseek-chat"
+# 模型不固定：LLM_MODEL 留空 = 自动模式（默认），见 discover_models()。
+# 填了就优先用填的，400 模型不存在时自动换下一个。
+LLM_MODEL = os.environ.get("LLM_MODEL", "").strip()
+# 快/便宜优先（为 5 秒被动回复红线）：自动模式按这个顺序挑。
+PREFERRED_MODELS = [
+    "deepseek-chat", "qwen-turbo", "qwen-plus", "gpt-4o-mini",
+    "gpt-4o", "muse-spark", "deepseek-reasoner",
+]
+_SKIP_SUBSTRINGS = ("embed", "tts", "whisper", "image", "video", "audio")
+_MODEL_CACHE_TTL_SEC = 600  # 模型列表缓存 10 分钟
+# 内存缓存：{"models": [id, ...], "fetched_at": monotonic 秒}
+_MODEL_CACHE = {"models": [], "fetched_at": 0.0}
+# 自动模式下最近一次挑中的模型（health / 启动日志用；不做网络调用）。
+_AUTO_MODEL = None
 
 
 def _int_env(name, default):
@@ -80,7 +99,7 @@ HELP_TEXT = (
     "· 云原生都包括什么？\n"
     "知识库（网络、通信工程、Docker、Kubernetes、云原生）作参考，"
     "由大模型综合回答，知识库里没有的话题也能问。\n"
-    "模型可在 .env 里自由配置，不用改代码。"
+    "模型可在 .env 里自由配置，不用改代码；留空则自动选一个快的。"
 )
 LLM_UNAVAILABLE_TEXT = "大模型暂时不可用，请稍后再问。"
 HELP_COMMANDS = {"帮助", "help", "菜单", "menu", "/help", "/menu", "你好", "hi", "hello"}
@@ -173,15 +192,139 @@ def extractive_fallback(chunks):
     return text[:MAX_ANSWER_CHARS]
 
 
+def _is_skip_model(model_id):
+    low = (model_id or "").lower()
+    return any(s in low for s in _SKIP_SUBSTRINGS)
+
+
+def _ordered_auto_models(models):
+    """自动模式的候选顺序：优先名单在先，其次非 embedding/音视频模型，
+    最后才是 embedding/音视频模型（总比没有强）。大小写不敏感去重。"""
+    by_lower = {}
+    for m in models or []:
+        if m and str(m).strip():
+            by_lower.setdefault(str(m).strip().lower(), str(m).strip())
+    ordered = []
+    for pref in PREFERRED_MODELS:
+        if pref in by_lower:
+            ordered.append(by_lower[pref])
+    for m in models or []:
+        m = str(m).strip()
+        if m and m not in ordered and not _is_skip_model(m):
+            ordered.append(m)
+    for m in models or []:
+        m = str(m).strip()
+        if m and m not in ordered:
+            ordered.append(m)
+    return ordered
+
+
+def _parse_model_list(payload):
+    if isinstance(payload, dict):
+        data = payload.get("data", [])
+    elif isinstance(payload, list):
+        data = payload
+    else:
+        return []
+    ids = []
+    for item in data or []:
+        if isinstance(item, dict) and item.get("id"):
+            ids.append(str(item["id"]).strip())
+        elif isinstance(item, str) and item.strip():
+            ids.append(item.strip())
+    return [i for i in ids if i]
+
+
+def discover_models(force=False):
+    """GET {base}/models 发现网关上实际有的模型，缓存 10 分钟。
+
+    失败或为空时返回之前缓存的列表（可能为空），绝不抛异常、不挂起：
+    调用方会用优先名单盲试或走摘录兜底。只记模型名，不记 Key。
+    """
+    global _AUTO_MODEL
+    now = time.monotonic()
+    if not force and _MODEL_CACHE["models"] and now - _MODEL_CACHE["fetched_at"] < _MODEL_CACHE_TTL_SEC:
+        return list(_MODEL_CACHE["models"])
+    if not LLM_API_KEY:
+        return list(_MODEL_CACHE["models"])
+    url = LLM_API_BASE.rstrip("/") + "/models"
+    try:
+        resp = requests.get(
+            url,
+            headers={"Authorization": f"Bearer {LLM_API_KEY}"},
+            timeout=3,
+        )
+        resp.raise_for_status()
+        models = _parse_model_list(resp.json())
+    except Exception as e:
+        log("模型发现失败：", type(e).__name__, str(e)[:200])
+        return list(_MODEL_CACHE["models"])
+    if models:
+        _MODEL_CACHE["models"] = models
+        _MODEL_CACHE["fetched_at"] = now
+        picked = _ordered_auto_models(models)
+        if picked:
+            _AUTO_MODEL = picked[0]
+        log("模型发现成功：", len(models), "个，自动选用", _AUTO_MODEL)
+    return list(_MODEL_CACHE["models"])
+
+
+def pick_auto_model(models):
+    """从已发现的列表里挑一个：优先名单在先，否则第一个非 embedding/
+    音视频模型，都没有则取第一个。无列表返回 None。"""
+    ordered = _ordered_auto_models(models)
+    return ordered[0] if ordered else None
+
+
+def _model_not_found_text(text):
+    low = (text or "").lower()
+    if "model" not in low:
+        return False
+    return ("not found" in low or "unavailable" in low
+            or "11102" in low or "service info not found" in low)
+
+
+def _error_body(exc):
+    resp = getattr(exc, "response", None)
+    if resp is None:
+        return str(exc)
+    text = getattr(resp, "text", "") or ""
+    if text:
+        return text
+    try:
+        return str(resp.json())
+    except Exception:
+        return str(exc)
+
+
+def _llm_startup_info():
+    """启动日志用的模型信息：(mode, model_display, models_info)。
+
+    fixed: LLM=<已配模型>@<base>；auto: LLM=auto(<选中>)@<base>，
+    models=<n> discovered 或 models=discovery failed。
+    """
+    if LLM_MODEL:
+        return "fixed", LLM_MODEL, None
+    models = discover_models()
+    if models:
+        picked = pick_auto_model(models)
+        return "auto", picked or "auto:unknown", f"models={len(models)} discovered"
+    return "auto", "auto:unknown", "models=discovery failed"
+
+
 def call_llm(question, chunks):
     """调 OpenAI 兼容接口。成功返回回答文本，失败抛异常（调用方兜底）。
 
     chunks 可以为空：有摘录时当参考发给大模型，没摘录时大模型直接
-    用通用知识回答。模型、地址、超时、token 上限全部来自环境变量，
-    代码里不固定任何模型选择。
+    用通用知识回答。模型、地址、超时、token 上限全部来自环境变量。
+    自动模式：LLM_MODEL 留空时先发现模型再按优先顺序挑；已配模型
+    优先用，400 模型不存在时自动换下一个。LLM_TIMEOUT_SEC 是全部
+    尝试的总预算，不是每次尝试的超时；每次尝试用剩余时间（至少 1 秒，
+    但总耗时不会无限制拖下去——超过预算即停）。
     """
     if not LLM_API_KEY:
         raise RuntimeError("LLM_API_KEY 未配置")
+    deadline = time.monotonic() + LLM_TIMEOUT_SEC
     if chunks:
         context = "\n\n---\n\n".join(
             f"【{c['source']} / {c['heading']}】\n{c['text']}" for c in chunks
@@ -189,34 +332,85 @@ def call_llm(question, chunks):
         user_content = f"知识库摘录（仅供参考）：\n{context}\n\n问题：{question}"
     else:
         user_content = f"问题：{question}"
-    payload = {
-        "model": LLM_MODEL,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_content},
-        ],
-        "temperature": 0.3,
-        "max_tokens": LLM_MAX_TOKENS,
-    }
-    url = LLM_API_BASE.rstrip("/") + "/chat/completions"
-    resp = requests.post(
-        url,
-        headers={"Authorization": f"Bearer {LLM_API_KEY}",
-                 "Content-Type": "application/json"},
-        json=payload,
-        timeout=LLM_TIMEOUT_SEC,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    content = data["choices"][0]["message"]["content"]
-    if not content or not content.strip():
-        raise RuntimeError("LLM 返回空内容")
-    answer = content.strip()
-    if chunks and format_sources(chunks) not in answer:
-        # 先给来源行留位置再截断，避免长回答把来源截掉
-        sources = "\n\n" + format_sources(chunks)
-        answer = answer[:max(MAX_ANSWER_CHARS - len(sources), 0)] + sources
-    return answer[:MAX_ANSWER_CHARS]
+    candidates = []
+    if LLM_MODEL:
+        candidates.append(LLM_MODEL)
+    else:
+        models = discover_models()
+        candidates = _ordered_auto_models(models) or list(PREFERRED_MODELS)
+    tried = []
+    last_error = RuntimeError("没有可用的模型")
+    for model in candidates:
+        if model in tried:
+            continue
+        tried.append(model)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        attempt_timeout = remaining if remaining >= 1 else 1.0
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_content},
+            ],
+            "temperature": 0.3,
+            "max_tokens": LLM_MAX_TOKENS,
+        }
+        url = LLM_API_BASE.rstrip("/") + "/chat/completions"
+        try:
+            resp = requests.post(
+                url,
+                headers={"Authorization": f"Bearer {LLM_API_KEY}",
+                         "Content-Type": "application/json"},
+                json=payload,
+                timeout=attempt_timeout,
+            )
+            status = getattr(resp, "status_code", None)
+            if status is not None and status >= 400:
+                body = getattr(resp, "text", "") or ""
+                if status == 400 and _model_not_found_text(body):
+                    log("模型不存在，换下一个：", model, body[:200])
+                    last_error = RuntimeError(f"模型 {model} 不存在")
+                    _extend_candidates(candidates, tried)
+                    continue
+                resp.raise_for_status()
+            resp.raise_for_status()
+        except requests.exceptions.HTTPError as e:
+            body = _error_body(e)
+            if _model_not_found_text(body):
+                log("模型不存在，换下一个：", model, body[:200])
+                last_error = RuntimeError(f"模型 {model} 不存在：{body[:200]}")
+                _extend_candidates(candidates, tried)
+                continue
+            raise
+        except (requests.exceptions.Timeout,
+                requests.exceptions.ConnectionError):
+            raise
+        except Exception:
+            raise
+        data = resp.json()
+        content = data["choices"][0]["message"]["content"]
+        if not content or not content.strip():
+            raise RuntimeError("LLM 返回空内容")
+        answer = content.strip()
+        if chunks and format_sources(chunks) not in answer:
+            # 先给来源行留位置再截断，避免长回答把来源截掉
+            sources = "\n\n" + format_sources(chunks)
+            answer = answer[:max(MAX_ANSWER_CHARS - len(sources), 0)] + sources
+        return answer[:MAX_ANSWER_CHARS]
+    raise last_error
+
+
+def _extend_candidates(candidates, tried):
+    """400 模型不存在后刷新发现列表，把没试过的新模型追加到候选队尾。"""
+    try:
+        models = discover_models(force=True)
+    except Exception:
+        return
+    for m in _ordered_auto_models(models):
+        if m not in tried and m not in candidates:
+            candidates.append(m)
 
 
 def answer_question(question, index):
@@ -242,7 +436,12 @@ INDEX = KnowledgeIndex(KNOWLEDGE_DIR)
 @app.route("/health", methods=["GET"])
 def health():
     stats = INDEX.stats()
-    return {"status": "ok", "version": VERSION, **stats}
+    if LLM_MODEL:
+        llm_mode, llm_model = "fixed", LLM_MODEL
+    else:
+        llm_mode, llm_model = "auto", _AUTO_MODEL or "auto:unknown"
+    return {"status": "ok", "version": VERSION, **stats,
+            "llm_mode": llm_mode, "llm_model": llm_model}
 
 
 @app.route("/mp/callback", methods=["GET"])
@@ -300,8 +499,14 @@ def admin_reload():
 
 
 if __name__ == "__main__":
+    _mode, _model, _models_info = _llm_startup_info()
+    if _mode == "fixed":
+        _llm_log = f"LLM={_model}@{LLM_API_BASE}"
+    else:
+        _llm_log = (f"LLM=auto({_model})@{LLM_API_BASE}，"
+                    f"{_models_info or 'models=discovery failed'}")
     log(f"公众号 RAG 机器人 v{VERSION} 启动：监听 0.0.0.0:{PORT}，"
-        f"知识库 {INDEX.stats()}，LLM={LLM_MODEL}@{LLM_API_BASE}，"
+        f"知识库 {INDEX.stats()}，{_llm_log}，"
         f"超时 {LLM_TIMEOUT_SEC}s，上限 {LLM_MAX_TOKENS} tokens，"
         f"MP_TOKEN={'已配置' if MP_TOKEN else '未配置'}，"
         f"LLM_API_KEY={'已配置' if LLM_API_KEY else '未配置'}")
