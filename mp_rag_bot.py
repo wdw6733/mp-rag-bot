@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""公众号轻量 RAG 机器人 v1.2。
+"""公众号轻量 RAG 机器人 v1.3。
 
 服务号（未微信认证）发文字消息 -> 微信 POST 到 /mp/callback ->
 检索 knowledge/ 里的 Markdown 作参考 -> 调用户自配的大模型综合回答 ->
@@ -18,11 +18,20 @@
 优先用，400 模型不存在时自动换下一个。LLM_TIMEOUT_SEC 是全部
 尝试的总预算，不是每次尝试的超时。
 
+异步查询（v1.3）：大模型慢（muse2api 实测经常超过 4 秒）时，不能傻等，
+因为微信被动回复必须在 5 秒内到，超时粉丝什么都收不到。所以问答分
+两步：先在后台线程调大模型，主请求只等 LLM_FIRST_WAIT_SEC（默认 4 秒）；
+等到了直接回答案，等不到先回一句“正在查询，请稍等…”，后台继续跑到
+LLM_TIMEOUT_SEC（默认 20 秒），结果缓存在内存里，粉丝再发“继续”或重发
+同样的问题就能拿到答案。未认证的号没有客服消息，机器人不能主动再推
+一条消息，只能等粉丝再发一条消息来取结果——这是这个号能做到的上限，
+认证（300 元/年）后才能用客服消息直接把答案推过去。
+
 未认证服务号的限制（v1.1 不做、也做不了）：
 - 只有 5 秒内被动回复，没有 48 小时客服消息；
 - 服务器配置启用后，自定义菜单不可用。
 认证（300 元/年）后才能用客服消息突破 5 秒、才能用自定义菜单，
-那是可选的后续升级，不是 v1.2 的必需项。
+那是可选的后续升级，不是 v1.3 的必需项。
 
 凭证与模型只从环境变量读，绝不写进代码、README、日志。
 模型不固定：LLM_API_BASE / LLM_API_KEY / LLM_MODEL 由用户在 .env 里
@@ -32,6 +41,7 @@
 """
 import hashlib
 import os
+import threading
 import time
 import xml.etree.ElementTree as ET
 
@@ -40,7 +50,7 @@ from flask import Flask, request
 
 from retrieval import KnowledgeIndex
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 PORT = int(os.environ.get("MP_PORT", "18790"))
 KNOWLEDGE_DIR = os.environ.get(
     "KNOWLEDGE_DIR",
@@ -74,8 +84,21 @@ def _int_env(name, default):
         return default
 
 
-# 微信要求 5 秒内回复，LLM 超时默认 4 秒、留 1 秒余量；都可在 .env 里改。
-LLM_TIMEOUT_SEC = _int_env("LLM_TIMEOUT_SEC", 4)
+def _float_env(name, default):
+    try:
+        return float(os.environ.get(name, str(default)).strip() or default)
+    except ValueError:
+        return default
+
+
+# v1.3 两个超时，分工不同，不要混淆：
+# - LLM_TIMEOUT_SEC：后台大模型调用的总预算，默认 20 秒。20 秒还没回
+#   就改用摘录兜底并缓存，粉丝发“继续”拿到的是兜底结果。
+# - LLM_FIRST_WAIT_SEC：主请求等后台的第一段等待，默认 4 秒。微信被动
+#   回复必须在 5 秒内到，所以这个值绝不能超过 4.5 秒（代码里会截断），
+#   否则等不到答案、占位提示也发不出去，粉丝什么都收不到。
+LLM_TIMEOUT_SEC = _int_env("LLM_TIMEOUT_SEC", 20)
+LLM_FIRST_WAIT_SEC = _float_env("LLM_FIRST_WAIT_SEC", 4)
 LLM_MAX_TOKENS = _int_env("LLM_MAX_TOKENS", 800)
 ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "").strip()
 MAX_ANSWER_CHARS = 1000  # 5 秒被动回复要短：截断到约 1000 字（v1.0 是 1800）
@@ -103,6 +126,48 @@ HELP_TEXT = (
 )
 LLM_UNAVAILABLE_TEXT = "大模型暂时不可用，请稍后再问。"
 HELP_COMMANDS = {"帮助", "help", "菜单", "menu", "/help", "/menu", "你好", "hi", "hello"}
+
+# v1.3 异步查询：占位提示与“继续”取结果。
+# 注意占位提示里写的是总预算秒数（默认 20 秒），由 _placeholder_text() 按
+# 当前 LLM_TIMEOUT_SEC 动态生成，改了超时配置提示里的数字也会跟着变。
+STILL_WAITING_TEXT = "还在查询，请再等一下，稍后再发“继续”。"
+CONTINUE_COMMANDS = {"继续", "继续查询", "好了吗", "好了么", "结果", "查看结果", "继续查"}
+# 每个用户同时只保留一个查询任务：{user_hash: job}，内存保存，不写文件、
+# 不建数据库。Flask 开发服务器是单进程，重启后缓存清空——这是已知限制，
+# 见 README。job = {"question", "question_norm", "status", "answer",
+# "created_at" (monotonic 秒), "done_event" (threading.Event), "thread"}。
+_JOB_TTL_SEC = 600  # 查询结果保留 10 分钟，过期就丢掉
+_JOBS = {}
+_JOBS_LOCK = threading.Lock()
+
+
+def _placeholder_text():
+    return (
+        "正在查询，请稍等…\n"
+        f"（大模型正在回答，约{int(LLM_TIMEOUT_SEC)}秒内出结果，"
+        "稍后发“继续”或再发一次同样的问题查看结果）"
+    )
+
+
+def _first_wait_sec():
+    """首答等待秒数：配置值，但硬上限 4.5 秒——微信 5 秒红线，超了占位
+    提示本身都发不出去。测试里可把 LLM_FIRST_WAIT_SEC 设得很小。"""
+    try:
+        v = float(LLM_FIRST_WAIT_SEC)
+    except (TypeError, ValueError):
+        v = 4.0
+    return max(0.0, min(v, 4.5))
+
+
+def _normalize_question(text):
+    """缓存键用的问题归一化：去首尾空白、压掉中间多余空白、小写。"""
+    return " ".join((text or "").strip().lower().split())
+
+
+def _is_continue_command(text):
+    """是不是取结果的命令：去掉尾巴上的标点再比，避免“继续。”认不出。"""
+    t = (text or "").strip().lower().strip("。？?！!、，, ")
+    return t in CONTINUE_COMMANDS
 
 
 def log(*args):
@@ -413,20 +478,121 @@ def _extend_candidates(candidates, tried):
             candidates.append(m)
 
 
-def answer_question(question, index):
-    """问答主流程：检索作参考 -> 大模型综合回答（失败则摘录兜底）。
+def _prune_jobs_locked():
+    """删掉过期的任务（调用方必须已持有 _JOBS_LOCK）。"""
+    now = time.monotonic()
+    for key in [k for k, j in _JOBS.items()
+                if now - j["created_at"] > _JOB_TTL_SEC]:
+        del _JOBS[key]
 
-    检索不到不拦路：大模型照常回答；大模型失败且检索有结果才回摘录，
-    大模型失败且检索也没结果时回一句短的“请稍后再问”。
+
+def _get_job(user_hash):
+    """取某用户当前任务；过期或没有返回 None。线程安全。"""
+    with _JOBS_LOCK:
+        _prune_jobs_locked()
+        return _JOBS.get(user_hash)
+
+
+def _clear_job(user_hash, job):
+    """结果取走后删掉任务（只删“还是这个任务”时才删，避免误删新任务）。"""
+    with _JOBS_LOCK:
+        if _JOBS.get(user_hash) is job:
+            del _JOBS[user_hash]
+
+
+def _reset_jobs():
+    """清空全部任务：测试用，生产代码不调。"""
+    with _JOBS_LOCK:
+        _JOBS.clear()
+
+
+def _start_job(user_hash, question, question_norm):
+    job = {
+        "question": question,
+        "question_norm": question_norm,
+        "status": "running",
+        "answer": None,
+        "created_at": time.monotonic(),
+        "done_event": threading.Event(),
+        "thread": None,
+    }
+    with _JOBS_LOCK:
+        _prune_jobs_locked()
+        _JOBS[user_hash] = job
+    return job
+
+
+def _run_job(job, user_hash, question, chunks):
+    """后台线程：调大模型，成功就缓存答案，失败/超时就缓存摘录兜底。
+
+    结果只在“这个任务还是该用户的当前任务”时才算已缓存；中途用户问了
+    新问题、任务被取代了，算完也丢弃（但照样置 done_event，让还在首答
+    等待里的那次请求能拿到答案，而不是干等到占位超时）。
     """
+    try:
+        answer = call_llm(question, chunks)
+    except requests.exceptions.Timeout as e:
+        log("异步查询超时，改用兜底：", type(e).__name__, str(e)[:200])
+        answer = extractive_fallback(chunks)
+    except Exception as e:
+        log("LLM 调用失败，改用兜底：", type(e).__name__, str(e)[:200])
+        answer = extractive_fallback(chunks)
+    with _JOBS_LOCK:
+        job["status"] = "done"
+        job["answer"] = answer
+        still_current = _JOBS.get(user_hash) is job
+    job["done_event"].set()
+    if still_current:
+        log("异步结果已缓存 user=", user_hash, "len=", len(answer))
+    else:
+        log("异步结果已丢弃（被新问题取代）user=", user_hash)
+
+
+def answer_question(question, index, user_hash="anon"):
+    """问答主流程（v1.3 异步）：检索作参考 -> 后台调大模型。
+
+    快路径：大模型在 LLM_FIRST_WAIT_SEC（默认 4 秒）内回完，直接回答案，
+    和 v1.2 一样；任务随即清除，之后再发“继续”只会回帮助。
+    慢路径：4 秒没回完，先回占位提示“正在查询，请稍等…”，后台继续跑到
+    LLM_TIMEOUT_SEC（默认 20 秒）；结果缓存 10 分钟，粉丝发“继续”或重发
+    同样的问题来取。重发同样的问题、且任务还在跑时不重复开任务。
+    “继续”类命令：有已完成的任务就取走答案并清除；还在跑就回“还在查询”；
+    没有任务就回帮助。检索不到不拦路，失败兜底逻辑与 v1.2 相同。
+    """
+    if _is_continue_command(question):
+        job = _get_job(user_hash)
+        if job is None:
+            return HELP_TEXT
+        if job["status"] == "running":
+            return STILL_WAITING_TEXT
+        answer = job["answer"]
+        _clear_job(user_hash, job)
+        return answer
+    norm = _normalize_question(question)
+    job = _get_job(user_hash)
+    if job is not None and job["question_norm"] == norm:
+        if job["status"] == "running":
+            return STILL_WAITING_TEXT
+        answer = job["answer"]
+        _clear_job(user_hash, job)
+        return answer
     chunks = index.search(question, top_n=3)
     log("提问 len=", len(question), "命中：",
         ", ".join(f"{c['source']}#{c['heading']}" for c in chunks) or "无")
-    try:
-        return call_llm(question, chunks)
-    except Exception as e:
-        log("LLM 调用失败，改用兜底：", type(e).__name__, str(e)[:200])
-        return extractive_fallback(chunks)
+    if job is not None:
+        log("新问题取代旧查询 user=", user_hash)
+    job = _start_job(user_hash, question, norm)
+    thread = threading.Thread(
+        target=_run_job, args=(job, user_hash, question, chunks),
+        daemon=True)
+    job["thread"] = thread
+    thread.start()
+    if job["done_event"].wait(timeout=_first_wait_sec()):
+        answer = job["answer"]
+        _clear_job(user_hash, job)
+        return answer
+    log("提问 len=", len(question), "异步查询中 user=", user_hash)
+    return _placeholder_text()
 
 
 app = Flask(__name__)
@@ -440,8 +606,14 @@ def health():
         llm_mode, llm_model = "fixed", LLM_MODEL
     else:
         llm_mode, llm_model = "auto", _AUTO_MODEL or "auto:unknown"
+    with _JOBS_LOCK:
+        _prune_jobs_locked()
+        active_jobs = len(_JOBS)
     return {"status": "ok", "version": VERSION, **stats,
-            "llm_mode": llm_mode, "llm_model": llm_model}
+            "llm_mode": llm_mode, "llm_model": llm_model,
+            "llm_timeout_sec": LLM_TIMEOUT_SEC,
+            "llm_first_wait_sec": _first_wait_sec(),
+            "async_jobs": active_jobs}
 
 
 @app.route("/mp/callback", methods=["GET"])
@@ -477,13 +649,14 @@ def mp_callback():
         log("忽略非文本消息：", msg["msg_type"])
         return "", 200
     question = msg["content"]
-    log("收到提问 user=", _user_hash(msg["from_user"]), "len=", len(question))
+    user_hash = _user_hash(msg["from_user"])
+    log("收到提问 user=", user_hash, "len=", len(question))
     if is_help_command(question):
         answer = HELP_TEXT
     elif not question:
         answer = HELP_TEXT
     else:
-        answer = answer_question(question, INDEX)
+        answer = answer_question(question, INDEX, user_hash=user_hash)
     return build_text_reply(msg["from_user"], msg["to_user"], answer), 200, \
         {"Content-Type": "application/xml; charset=utf-8"}
 
@@ -507,7 +680,8 @@ if __name__ == "__main__":
                     f"{_models_info or 'models=discovery failed'}")
     log(f"公众号 RAG 机器人 v{VERSION} 启动：监听 0.0.0.0:{PORT}，"
         f"知识库 {INDEX.stats()}，{_llm_log}，"
-        f"超时 {LLM_TIMEOUT_SEC}s，上限 {LLM_MAX_TOKENS} tokens，"
+        f"首答等待 {_first_wait_sec()}s，总预算 {LLM_TIMEOUT_SEC}s，"
+        f"上限 {LLM_MAX_TOKENS} tokens，"
         f"MP_TOKEN={'已配置' if MP_TOKEN else '未配置'}，"
         f"LLM_API_KEY={'已配置' if LLM_API_KEY else '未配置'}")
     app.run(host="0.0.0.0", port=PORT)
