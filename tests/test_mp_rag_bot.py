@@ -1,16 +1,20 @@
 # -*- coding: utf-8 -*-
-"""公众号 RAG 机器人 v1.2 测试。
+"""公众号 RAG 机器人 v1.3 测试。
 
 只测本地逻辑，不连微信、不连真实 LLM、不读真实 NAS：
 LLM 的 HTTP 调用全部 mock，知识库用仓库里真实的 7 篇种子文档。
-v1.2 回答模式（自动选模型）：大模型是主力，知识库只是参考；检索不到也照常让
-大模型用通用知识回答，只有大模型失败时才兜底。
+v1.3 回答模式（异步查询）：大模型是主力，知识库只是参考；检索不到也照常让
+大模型用通用知识回答，只有大模型失败时才兜底；4 秒内回完直接回答案，
+4 秒没回完先回占位提示，后台继续跑到总预算（默认 20 秒），发“继续”取结果。
+测试里绝不真睡 20 秒：都用很小的 LLM_TIMEOUT_SEC / LLM_FIRST_WAIT_SEC。
 运行：python -m pytest tests/ -v
 """
 import hashlib
 import json
 import os
 import sys
+import threading
+import time
 
 import pytest
 
@@ -51,7 +55,9 @@ def _reset_model_state():
     mpb._MODEL_CACHE["models"] = []
     mpb._MODEL_CACHE["fetched_at"] = 0.0
     mpb._AUTO_MODEL = None
+    mpb._reset_jobs()
     yield
+    mpb._reset_jobs()
     mpb._MODEL_CACHE["models"] = []
     mpb._MODEL_CACHE["fetched_at"] = 0.0
     mpb._AUTO_MODEL = None
@@ -240,7 +246,7 @@ def test_call_llm_success(monkeypatch, index):
         captured["url"] = url
         captured["model"] = json["model"]
         assert headers["Authorization"] == "Bearer test-key"
-        assert timeout == pytest.approx(4, abs=0.01)
+        assert timeout == pytest.approx(20, abs=0.01)  # v1.3 默认总预算 20 秒
         return _FakeResp({"choices": [{"message": {"content": "bridge 是默认模式。"}}]})
 
     monkeypatch.setattr(mpb, "LLM_API_KEY", "test-key")
@@ -379,9 +385,11 @@ def test_help_text_mentions_llm_primary():
     assert "自由配置" in mpb.HELP_TEXT
 
 
-def test_version_is_1_2():
-    assert mpb.VERSION == "1.2.0"
+def test_version_is_1_3():
+    assert mpb.VERSION == "1.3.0"
     assert mpb.MAX_ANSWER_CHARS == 1000
+    assert mpb.LLM_TIMEOUT_SEC == 20
+    assert mpb.LLM_FIRST_WAIT_SEC == 4
 
 
 # ---------------- HTTP 端点 ----------------
@@ -391,11 +399,14 @@ def test_health(client):
     assert r.status_code == 200
     data = r.get_json()
     assert data["status"] == "ok"
-    assert data["version"] == "1.2.0"
+    assert data["version"] == "1.3.0"
     assert data["docs"] == 7
     assert data["chunks"] >= 28
     assert data["llm_mode"] == "auto"
     assert data["llm_model"] == "auto:unknown"
+    assert data["llm_timeout_sec"] == 20
+    assert data["llm_first_wait_sec"] == 4
+    assert data["async_jobs"] == 0
 
 
 def test_get_verify_success(client):
@@ -595,7 +606,7 @@ def test_call_llm_auto_picks_discovered_model(monkeypatch, index):
     monkeypatch.setattr(mpb.requests, "post", fake_post)
     assert "ok" in mpb.call_llm("Docker 网络模式", chunks)
     assert captured["model"] == "qwen-turbo"
-    assert captured["timeout"] <= 4
+    assert captured["timeout"] <= 20  # v1.3 默认总预算 20 秒
 
 
 def test_call_llm_configured_400_retries_next_model(monkeypatch, index):
@@ -743,3 +754,246 @@ def test_answer_question_auto_400_falls_back_to_extractive(monkeypatch, index):
     ans = mpb.answer_question("Docker 网络模式有哪些", index)
     assert "大模型暂时不可用" in ans
     assert "04-docker-network.md" in ans
+
+# ---------------- v1.3 异步查询 ----------------
+# 注意：这些测试绝不真睡 20 秒，都用很小的 LLM_TIMEOUT_SEC /
+# LLM_FIRST_WAIT_SEC（0.1~1 秒级），再用 time.sleep 等后台线程跑完。
+
+def _mock_slow_llm(monkeypatch, delay, answer="慢模型答案。", calls=None):
+    """把 call_llm 换成睡 delay 秒再回答案的假实现。"""
+    def fake_call(q, c):
+        if calls is not None:
+            calls["n"] += 1
+        time.sleep(delay)
+        return answer
+    monkeypatch.setattr(mpb, "call_llm", fake_call)
+
+
+def _post_text(client, content, from_user="user_openid_abc"):
+    return client.post("/mp/callback", data=_text_xml(from_user=from_user, content=content),
+                       content_type="application/xml")
+
+
+def test_placeholder_text():
+    text = mpb._placeholder_text()
+    assert "正在查询，请稍等" in text
+    assert "继续" in text
+    assert "20秒" in text  # 默认总预算 20 秒
+
+
+def test_placeholder_uses_configured_timeout(monkeypatch, index):
+    monkeypatch.setattr(mpb, "LLM_TIMEOUT_SEC", 30)
+    monkeypatch.setattr(mpb, "LLM_FIRST_WAIT_SEC", 0.1)
+    _mock_slow_llm(monkeypatch, 0.5)
+    ans = mpb.answer_question("Docker 网络模式有哪些", index, user_hash="u-ph")
+    assert "约30秒内" in ans
+    time.sleep(0.6)  # 等后台线程跑完再结束，避免残留线程
+
+
+def test_is_continue_command():
+    for cmd in ("继续", "继续查询", "好了吗", "好了么", "结果", "查看结果", "继续查", "继续。"):
+        assert mpb._is_continue_command(cmd) is True
+    assert mpb._is_continue_command("Docker 网络模式") is False
+    assert mpb._is_continue_command("") is False
+    assert mpb._is_continue_command("继续努力") is False
+
+
+def test_normalize_question():
+    assert mpb._normalize_question("  Docker   网络模式 ") == "docker 网络模式"
+    assert mpb._normalize_question("K8s Service") == "k8s service"
+    assert mpb._normalize_question("") == ""
+
+
+def test_first_wait_sec_clamped(monkeypatch):
+    monkeypatch.setattr(mpb, "LLM_FIRST_WAIT_SEC", 10)
+    assert mpb._first_wait_sec() == 4.5  # 超过 4.5 秒截断，保住 5 秒红线
+    monkeypatch.setattr(mpb, "LLM_FIRST_WAIT_SEC", 0.2)
+    assert mpb._first_wait_sec() == 0.2
+    monkeypatch.setattr(mpb, "LLM_FIRST_WAIT_SEC", "bad")
+    assert mpb._first_wait_sec() == 4.0
+
+
+def test_fast_path_returns_answer_directly(client, monkeypatch):
+    # 快路径：大模型立刻回，直接就是答案，不出现占位提示
+    monkeypatch.setattr(mpb, "call_llm", lambda q, c: "bridge 是默认模式。")
+    r = _post_text(client, "Docker 网络模式有哪些")
+    assert r.status_code == 200
+    body = r.get_data(as_text=True)
+    assert "bridge 是默认模式" in body
+    assert "正在查询" not in body
+    # 答案已取走并清除，再发“继续”只回帮助，不会重复发答案
+    r2 = _post_text(client, "继续")
+    assert "TCP 三次握手" in r2.get_data(as_text=True)
+
+
+def test_slow_path_placeholder_then_continue(client, monkeypatch):
+    monkeypatch.setattr(mpb, "LLM_FIRST_WAIT_SEC", 0.2)
+    monkeypatch.setattr(mpb, "LLM_TIMEOUT_SEC", 5)
+    _mock_slow_llm(monkeypatch, 0.6, "慢模型答案：bridge 是默认模式。")
+    r = _post_text(client, "Docker 网络模式有哪些")
+    assert r.status_code == 200
+    assert "正在查询，请稍等" in r.get_data(as_text=True)
+    time.sleep(0.7)  # 等后台跑完
+    r2 = _post_text(client, "继续")
+    assert "慢模型答案" in r2.get_data(as_text=True)
+    # 取过一次就清除，第二次“继续”回帮助
+    r3 = _post_text(client, "继续")
+    assert "TCP 三次握手" in r3.get_data(as_text=True)
+
+
+def test_continue_while_running_returns_still_waiting(client, monkeypatch):
+    monkeypatch.setattr(mpb, "LLM_FIRST_WAIT_SEC", 0.1)
+    monkeypatch.setattr(mpb, "LLM_TIMEOUT_SEC", 5)
+    _mock_slow_llm(monkeypatch, 1.0, "慢模型答案。")
+    r = _post_text(client, "Docker 网络模式有哪些")
+    assert "正在查询" in r.get_data(as_text=True)
+    r2 = _post_text(client, "继续")
+    assert "还在查询" in r2.get_data(as_text=True)
+    time.sleep(1.1)
+    r3 = _post_text(client, "继续")
+    assert "慢模型答案" in r3.get_data(as_text=True)
+
+
+def test_repeat_same_question_while_running_no_duplicate(client, monkeypatch):
+    monkeypatch.setattr(mpb, "LLM_FIRST_WAIT_SEC", 0.1)
+    monkeypatch.setattr(mpb, "LLM_TIMEOUT_SEC", 5)
+    calls = {"n": 0}
+    _mock_slow_llm(monkeypatch, 0.8, "慢模型答案。", calls)
+    r = _post_text(client, "Docker 网络模式有哪些")
+    assert "正在查询" in r.get_data(as_text=True)
+    r2 = _post_text(client, "Docker 网络模式有哪些")
+    assert "还在查询" in r2.get_data(as_text=True)
+    assert calls["n"] == 1  # 没有重复开任务
+    time.sleep(0.9)
+    r3 = _post_text(client, "继续")
+    assert "慢模型答案" in r3.get_data(as_text=True)
+    assert calls["n"] == 1
+
+
+def test_repeat_same_question_after_done_returns_cached(client, monkeypatch):
+    monkeypatch.setattr(mpb, "LLM_FIRST_WAIT_SEC", 0.1)
+    monkeypatch.setattr(mpb, "LLM_TIMEOUT_SEC", 5)
+    calls = {"n": 0}
+    _mock_slow_llm(monkeypatch, 0.5, "慢模型答案。", calls)
+    assert "正在查询" in _post_text(client, "Docker 网络模式有哪些").get_data(as_text=True)
+    time.sleep(0.6)
+    # 完成后重发原问题，直接拿到缓存答案，不再开新任务
+    assert "慢模型答案" in _post_text(client, "Docker 网络模式有哪些").get_data(as_text=True)
+    assert calls["n"] == 1
+    # 缓存已取走清除，再重发原问题会开新任务（占位提示），调用次数 +1
+    assert "正在查询" in _post_text(client, "Docker 网络模式有哪些").get_data(as_text=True)
+    time.sleep(0.6)
+    assert "慢模型答案" in _post_text(client, "继续").get_data(as_text=True)
+    assert calls["n"] == 2
+
+
+def test_background_timeout_caches_fallback(client, monkeypatch):
+    # 后台跑到总预算还没回：缓存摘录兜底，“继续”拿到的是兜底
+    monkeypatch.setattr(mpb, "LLM_FIRST_WAIT_SEC", 0.2)
+    monkeypatch.setattr(mpb, "LLM_TIMEOUT_SEC", 1)
+    monkeypatch.setattr(mpb, "LLM_MODEL", "deepseek-chat")
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        time.sleep(0.6)  # 超过 1 秒总预算的模拟慢调用
+        raise mpb.requests.exceptions.ReadTimeout("timed out")
+    monkeypatch.setattr(mpb.requests, "post", fake_post)
+    r = _post_text(client, "Docker 网络模式有哪些")
+    assert "正在查询" in r.get_data(as_text=True)
+    time.sleep(0.8)
+    r2 = _post_text(client, "继续")
+    body = r2.get_data(as_text=True)
+    assert "大模型暂时不可用" in body
+    assert "04-docker-network.md" in body
+
+
+def test_continue_with_no_job_returns_help(client):
+    r = _post_text(client, "继续")
+    assert r.status_code == 200
+    assert "TCP 三次握手" in r.get_data(as_text=True)
+
+
+def test_help_bypasses_running_job(client, monkeypatch):
+    monkeypatch.setattr(mpb, "LLM_FIRST_WAIT_SEC", 0.1)
+    monkeypatch.setattr(mpb, "LLM_TIMEOUT_SEC", 5)
+    _mock_slow_llm(monkeypatch, 1.0, "慢模型答案。")
+    assert "正在查询" in _post_text(client, "Docker 网络模式有哪些").get_data(as_text=True)
+    # “帮助”直接回帮助，不打断后台任务
+    assert "TCP 三次握手" in _post_text(client, "帮助").get_data(as_text=True)
+    time.sleep(1.1)
+    assert "慢模型答案" in _post_text(client, "继续").get_data(as_text=True)
+
+
+def test_job_ttl_expiry():
+    job = mpb._start_job("u-ttl", "Docker 网络模式", "docker 网络模式")
+    assert mpb._get_job("u-ttl") is job
+    job["created_at"] = time.monotonic() - 601  # 10 分钟 TTL 已过
+    assert mpb._get_job("u-ttl") is None
+
+
+def test_new_question_supersedes_old(client, monkeypatch):
+    monkeypatch.setattr(mpb, "LLM_FIRST_WAIT_SEC", 0.1)
+    monkeypatch.setattr(mpb, "LLM_TIMEOUT_SEC", 5)
+
+    def fake_call(q, c):
+        if "Docker" in q:
+            time.sleep(0.8)
+            return "旧答案。"
+        return "新答案：Service 是抽象。"
+    monkeypatch.setattr(mpb, "call_llm", fake_call)
+    assert "正在查询" in _post_text(client, "Docker 网络模式有哪些").get_data(as_text=True)
+    # 问新问题：直接拿到新答案，旧任务作废
+    assert "新答案" in _post_text(client, "K8s Service 是什么").get_data(as_text=True)
+    # “继续”只回帮助，旧答案不会再冒出来
+    assert "旧答案" not in _post_text(client, "继续").get_data(as_text=True)
+    time.sleep(1.0)  # 等旧线程跑完再结束测试
+
+
+def test_concurrent_users_get_own_answers(client, monkeypatch):
+    monkeypatch.setattr(mpb, "LLM_FIRST_WAIT_SEC", 0.1)
+    monkeypatch.setattr(mpb, "LLM_TIMEOUT_SEC", 5)
+
+    def fake_call(q, c):
+        time.sleep(0.5)
+        return f"答案：{q}"
+    monkeypatch.setattr(mpb, "call_llm", fake_call)
+    assert "正在查询" in _post_text(client, "Docker 网络模式有哪些", "user_a").get_data(as_text=True)
+    assert "正在查询" in _post_text(client, "K8s Service 是什么", "user_b").get_data(as_text=True)
+    time.sleep(0.6)
+    assert "答案：Docker 网络模式有哪些" in _post_text(client, "继续", "user_a").get_data(as_text=True)
+    assert "答案：K8s Service 是什么" in _post_text(client, "继续", "user_b").get_data(as_text=True)
+
+
+def test_answer_question_direct_slow_path(monkeypatch, index):
+    monkeypatch.setattr(mpb, "LLM_FIRST_WAIT_SEC", 0.1)
+    monkeypatch.setattr(mpb, "LLM_TIMEOUT_SEC", 5)
+    _mock_slow_llm(monkeypatch, 0.5, "直接调用慢答案。")
+    ans = mpb.answer_question("Docker 网络模式有哪些", index, user_hash="u-direct")
+    assert "正在查询" in ans
+    time.sleep(0.6)
+    ans2 = mpb.answer_question("继续", index, user_hash="u-direct")
+    assert "直接调用慢答案" in ans2
+
+
+def test_health_async_jobs_count(client, monkeypatch):
+    monkeypatch.setattr(mpb, "LLM_FIRST_WAIT_SEC", 0.1)
+    monkeypatch.setattr(mpb, "LLM_TIMEOUT_SEC", 5)
+    _mock_slow_llm(monkeypatch, 1.0, "慢模型答案。")
+    _post_text(client, "Docker 网络模式有哪些")
+    data = client.get("/health").get_json()
+    assert data["async_jobs"] == 1
+    time.sleep(1.1)
+    assert client.get("/health").get_json()["async_jobs"] == 1  # 完成后仍缓存着，等“继续”取
+    _post_text(client, "继续")
+    assert client.get("/health").get_json()["async_jobs"] == 0
+
+
+def test_slow_llm_threads_are_daemon(client, monkeypatch):
+    monkeypatch.setattr(mpb, "LLM_FIRST_WAIT_SEC", 0.1)
+    monkeypatch.setattr(mpb, "LLM_TIMEOUT_SEC", 5)
+    _mock_slow_llm(monkeypatch, 0.5, "慢模型答案。")
+    _post_text(client, "Docker 网络模式有哪些")
+    job = mpb._get_job(mpb._user_hash("user_openid_abc"))
+    assert job is not None
+    assert job["thread"] is not None
+    assert job["thread"].daemon is True
+    time.sleep(0.6)
