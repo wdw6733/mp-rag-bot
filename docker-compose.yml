@@ -1,0 +1,20 @@
+services:
+  mp-rag-bot:
+    # 直接拉预构建镜像升级，不用在 NAS 上放源码、不用 build。
+    # 镜像由 GitHub Actions 在每次 push 到 main 后自动构建并推到 ghcr.io。
+    image: ghcr.io/wdw6733/mp-rag-bot:latest
+    container_name: mp-rag-bot
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      # 宿主机端口 : 容器端口。回调 URL 里不需要写端口（走反代域名 443），
+      # 改宿主机端口只改冒号前面那个数字。
+      - "18790:18790"
+    volumes:
+      # 持久化数据（以后可能用到的缓存、日志）
+      - ./data:/data
+      # 知识库只读挂载：往 NAS 上这个目录里丢 .md 文件，
+      # 再调 POST /admin/reload 就能生效，不用重新拉镜像、不用重启容器。
+      # 注意：compose 里这个挂载会覆盖镜像内置的 7 篇种子文档，
+      # 所以首次部署前先把仓库 knowledge/ 下的 7 篇 .md 拷进 NAS 的 knowledge/ 目录。
+      - ./knowledge:/app/knowledge:ro
