@@ -1,4 +1,4 @@
-# 公众号轻量 RAG 机器人 v1.4.0
+# 公众号轻量 RAG 机器人 v1.4.1
 
 粉丝在公众号对话框发问题，机器人检索知识库作参考、调大模型综合回答，正常 4 秒内直接回答案，不用粉丝再发“继续”。大模型慢的时候先回一句“请稍等，查询中。。。”，后台继续查到 20 秒：认证过的号会自动把答案推给粉丝，没认证的号粉丝发“继续”取答案（见下面“异步查询”和“不用再发‘继续’”）。
 
@@ -52,14 +52,13 @@ flowchart LR
 
 ## 异步查询（v1.3 新增）
 
-**先说清楚一个硬限制：微信被动回复必须在粉丝发消息后 5 秒内到，超时粉丝就什么都收不到。** 这个号是个人、未认证的订阅号，没有客服消息，机器人不能在 20 秒后主动再推一条消息过去。所以“等 20 秒再直接回答案”是不可能的——那样答案永远发不出去，只会更糟。未认证的号上，v1.4 用的还是这个号能做到的办法：**先回占位提示，再让粉丝发“继续”来取结果**；认证并配好 AppID/Secret 后才能自动推（见“不用再发‘继续’”）。
+**先说清楚一个硬限制：微信被动回复必须在粉丝发消息后 5 秒内到，超时粉丝就什么都收不到。** 这个号是个人、未认证的订阅号，没有客服消息，机器人不能在 20 秒后主动再推一条消息过去。所以“等 20 秒再直接回答案”是不可能的——那样答案永远发不出去，只会更糟。未认证的号上，v1.4 用的还是这个号能做到的办法：**先回一行占位提示“请稍等，查询中。。。”**（v1.4.1 起占位只有这一行，不再写“稍后发‘继续’查看结果”）；认证并配好 AppID/Secret 后才能自动推（见“不用再发‘继续’”）。没认证的号上，粉丝发“继续”或重发原问题仍能拿到缓存的答案——只是占位里不再提示这一步。
 
 实际对话是这样的：
 
 ```
 粉丝：Docker 网络模式有哪些？
 机器人：请稍等，查询中。。。
-        （稍后发“继续”查看结果）
         ← 大模型 4 秒没回完时才这样回；4 秒内回完的直接就是答案
 粉丝：继续
 机器人：bridge 是默认模式，……（完整答案 + 来源）
@@ -88,7 +87,7 @@ flowchart LR
 
 **1. 大多数问题直接回。** 回答上限从 800 tokens 改成默认 400，检索只取前 2 块、每块上下文截到 800 字，提示词小了，大模型回得更快，4 秒内直接回答案的概率更高。粉丝什么都不用多做。
 
-**2. 慢回答自动推（要认证）。** 微信认证（300 元/年）后，在 `.env` 里配上 `MP_APPID` / `MP_APPSECRET`，慢回答查完机器人直接用客服消息把答案推给粉丝，占位提示也只有一行“请稍等，查询中。。。”，不再提“继续”。步骤：
+**2. 慢回答自动推（要认证）。** 微信认证（300 元/年）后，在 `.env` 里配上 `MP_APPID` / `MP_APPSECRET`，慢回答查完机器人直接用客服消息把答案推给粉丝。v1.4.1 起，占位提示在两种模式下都只有一行“请稍等，查询中。。。”，不再提“继续”。步骤：
 
 1. 微信认证（300 元/年，公众号后台申请）。
 2. 微信开发者平台 → 我的业务 → 公众号 → 基础信息，找到 AppID；同一页“开发密钥”里查看/重置 AppSecret。
@@ -179,11 +178,11 @@ docker compose down && docker compose up -d
 
 # 4. 看日志，确认起来了
 docker compose logs -f mp-rag-bot
-# 应该看到：公众号 RAG 机器人 v1.4.0 启动：监听 0.0.0.0:18790，知识库 {'docs': 7, ...}，LLM=auto(...)@...，models=... discovered，首答等待 4.0s，总预算 20s，上限 400 tokens，客服推送=未开启（未配 MP_APPID/MP_APPSECRET，慢回答需发“继续”取）
+# 应该看到：公众号 RAG 机器人 v1.4.1 启动：监听 0.0.0.0:18790，知识库 {'docs': 7, ...}，LLM=auto(...)@...，models=... discovered，首答等待 4.0s，总预算 20s，上限 400 tokens，客服推送=未开启（未配 MP_APPID/MP_APPSECRET，慢回答需发“继续”取）
 
 # 5. 检查健康接口
 curl http://127.0.0.1:18790/health
-# {"status":"ok","version":"1.4.0","docs":7,"chunks":...,"llm_mode":"auto","llm_model":"...","llm_timeout_sec":20,"llm_first_wait_sec":4.0,"llm_max_tokens":400,"push_enabled":false,"gating_enabled":true,"gated_users":0,"async_jobs":0}
+# {"status":"ok","version":"1.4.1","docs":7,"chunks":...,"llm_mode":"auto","llm_model":"...","llm_timeout_sec":20,"llm_first_wait_sec":4.0,"llm_max_tokens":400,"push_enabled":false,"gating_enabled":true,"gated_users":0,"async_jobs":0}
 ```
 
 ## 公众号后台配置
@@ -248,7 +247,7 @@ docker compose restart
 ```bash
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python -m pytest tests/ -v
-# 115 个测试：分词、分块、检索、签名、XML 解析、LLM 成功/无匹配照常回答/
+# 116 个测试：分词、分块、检索、签名、XML 解析、LLM 成功/无匹配照常回答/
 # 失败兜底（有摘录回摘录、无摘录回短提示）、模型可配置、1000 字截断、
 # 健康接口、URL 验证、文本/非文本/坏 XML 回调、管理重建鉴权，
 # 外加 v1.2 自动选模型：模型发现解析/缓存、优先顺序、跳过 embedding、
@@ -260,6 +259,8 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 # 客服推送（token 缓存、推送成功/48001 失败兜底、快路径不重复推、推送开关），
 # 外加 v1.4 新关注门禁（关注事件计时与欢迎语、一次免费提问、7 天自动解锁、
 # 管理员手动解锁、帮助与“继续”不算提问、取关重关不重置、损坏文件不崩）
+# 外加 v1.4.1 占位提示改成只有一行“请稍等，查询中。。。”（两种模式下都不提“继续”，
+# “继续”取缓存答案的机制仍在后台照常工作，只是不再写进占位提示里）
 
 # 本地启动（不连微信、不调真实 LLM 也能跑；LLM 未配 Key 时有摘录走摘录兜底，
 # 无摘录回“大模型暂时不可用，请稍后再问”）
@@ -281,7 +282,7 @@ mp-rag-bot/
 │   ├── 05-kubernetes-core.md
 │   ├── 06-kubernetes-network-service.md
 │   └── 07-cloud-native-overview.md
-├── tests/test_mp_rag_bot.py # pytest，115 个测试
+├── tests/test_mp_rag_bot.py # pytest，116 个测试
 ├── requirements.txt         # flask、requests
 ├── Dockerfile               # python:3.12-slim
 ├── docker-compose.yml       # 拉 ghcr.io/wdw6733/mp-rag-bot:latest
