@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
-"""公众号 RAG 机器人 v1.3.1 测试。
+"""公众号 RAG 机器人 v1.4.0 测试。
 
 只测本地逻辑，不连微信、不连真实 LLM、不读真实 NAS：
-LLM 的 HTTP 调用全部 mock，知识库用仓库里真实的 7 篇种子文档。
-v1.3 回答模式（异步查询）：大模型是主力，知识库只是参考；检索不到也照常让
-大模型用通用知识回答，只有大模型失败时才兜底；4 秒内回完直接回答案，
-4 秒没回完先回占位提示，后台继续跑到总预算（默认 20 秒），发“继续”取结果。
+LLM 和微信接口的 HTTP 调用全部 mock，知识库用仓库里真实的 7 篇种子文档。
+v1.4 回答模式：大多数问题 4 秒内直接回答案；大模型慢时先回占位提示，
+后台继续跑到总预算（默认 20 秒），推送开启（配 MP_APPID/MP_APPSECRET）
+时后台查完直接推答案，没开启时发“继续”取结果。
 测试里绝不真睡 20 秒：都用很小的 LLM_TIMEOUT_SEC / LLM_FIRST_WAIT_SEC。
 运行：python -m pytest tests/ -v
 """
@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 import sys
+import tempfile
 import threading
 import time
 
@@ -52,15 +53,30 @@ def index():
 
 @pytest.fixture(autouse=True)
 def _reset_model_state():
+    # 每个测试用独立的用量文件，不碰仓库 data/usage.json、不碰 /data
+    _orig_usage_file = mpb.USAGE_FILE
+    tmp_usage = os.path.join(tempfile.gettempdir(), "mp-rag-bot-test-usage.json")
+    if os.path.exists(tmp_usage):
+        os.remove(tmp_usage)
+    mpb.USAGE_FILE = tmp_usage
     mpb._MODEL_CACHE["models"] = []
     mpb._MODEL_CACHE["fetched_at"] = 0.0
     mpb._AUTO_MODEL = None
+    mpb.MP_APPID = ""
+    mpb.MP_APPSECRET = ""
+    mpb._reset_token_cache()
     mpb._reset_jobs()
     yield
     mpb._reset_jobs()
     mpb._MODEL_CACHE["models"] = []
     mpb._MODEL_CACHE["fetched_at"] = 0.0
     mpb._AUTO_MODEL = None
+    mpb.MP_APPID = ""
+    mpb.MP_APPSECRET = ""
+    mpb._reset_token_cache()
+    if os.path.exists(tmp_usage):
+        os.remove(tmp_usage)
+    mpb.USAGE_FILE = _orig_usage_file
 
 
 @pytest.fixture()
@@ -385,11 +401,12 @@ def test_help_text_mentions_llm_primary():
     assert "自由配置" in mpb.HELP_TEXT
 
 
-def test_version_is_1_3():
-    assert mpb.VERSION == "1.3.1"
+def test_version_is_1_4():
+    assert mpb.VERSION == "1.4.0"
     assert mpb.MAX_ANSWER_CHARS == 1000
     assert mpb.LLM_TIMEOUT_SEC == 20
     assert mpb.LLM_FIRST_WAIT_SEC == 4
+    assert mpb.LLM_MAX_TOKENS == 400  # v1.4：默认 400（原来 800），回答更短更快
 
 
 # ---------------- HTTP 端点 ----------------
@@ -399,13 +416,15 @@ def test_health(client):
     assert r.status_code == 200
     data = r.get_json()
     assert data["status"] == "ok"
-    assert data["version"] == "1.3.1"
+    assert data["version"] == "1.4.0"
     assert data["docs"] == 7
     assert data["chunks"] >= 28
     assert data["llm_mode"] == "auto"
     assert data["llm_model"] == "auto:unknown"
     assert data["llm_timeout_sec"] == 20
     assert data["llm_first_wait_sec"] == 4
+    assert data["llm_max_tokens"] == 400
+    assert data["push_enabled"] is False  # 默认没配 MP_APPID/MP_APPSECRET
     assert data["async_jobs"] == 0
 
 
@@ -874,6 +893,8 @@ def test_repeat_same_question_while_running_no_duplicate(client, monkeypatch):
 
 
 def test_repeat_same_question_after_done_returns_cached(client, monkeypatch):
+    # 门禁不影响本测试：把用户设为已关注 8 天（已解锁），否则重发原问题会被拦住
+    _seed_usage(mpb._user_hash("user_openid_abc"), subscribe_days_ago=8, question_count=5)
     monkeypatch.setattr(mpb, "LLM_FIRST_WAIT_SEC", 0.1)
     monkeypatch.setattr(mpb, "LLM_TIMEOUT_SEC", 5)
     calls = {"n": 0}
@@ -934,6 +955,8 @@ def test_job_ttl_expiry():
 
 
 def test_new_question_supersedes_old(client, monkeypatch):
+    # 门禁不影响本测试：把用户设为已关注 8 天（已解锁），否则新问题会被拦住
+    _seed_usage(mpb._user_hash("user_openid_abc"), subscribe_days_ago=8, question_count=5)
     monkeypatch.setattr(mpb, "LLM_FIRST_WAIT_SEC", 0.1)
     monkeypatch.setattr(mpb, "LLM_TIMEOUT_SEC", 5)
 
@@ -1000,3 +1023,394 @@ def test_slow_llm_threads_are_daemon(client, monkeypatch):
     assert job["thread"] is not None
     assert job["thread"].daemon is True
     time.sleep(0.6)
+
+# ---------------- v1.4 不用“继续”：直接回复加速 + 客服推送 ----------------
+# 推送默认关闭（MP_APPID/MP_APPSECRET 为空）；下面用 fake appid/secret，
+# token 和推送接口全部 mock，绝不连真实微信。
+
+def _enable_push(monkeypatch):
+    monkeypatch.setattr(mpb, "MP_APPID", "wx_test_appid")
+    monkeypatch.setattr(mpb, "MP_APPSECRET", "test-secret")
+
+
+def _mock_token(monkeypatch, calls=None, token="test-access-token"):
+    def fake_get(url, params=None, headers=None, timeout=None):
+        if calls is not None:
+            calls["n"] += 1
+        assert "cgi-bin/token" in url
+        assert params["appid"] == "wx_test_appid"
+        assert params["secret"] == "test-secret"
+        assert params["grant_type"] == "client_credential"
+        return _FakeModelResp({"access_token": token, "expires_in": 7200})
+    monkeypatch.setattr(mpb.requests, "get", fake_get)
+
+
+def _mock_push_post(monkeypatch, calls, errcode=0, errmsg="ok"):
+    def fake_post(url, params=None, headers=None, json=None, timeout=None):
+        calls["n"] += 1
+        calls["url"] = url
+        calls["params"] = params
+        calls["payload"] = json
+        assert "cgi-bin/message/custom/send" in url
+        assert params["access_token"] == "test-access-token"
+        return _FakeResp({"errcode": errcode, "errmsg": errmsg})
+    monkeypatch.setattr(mpb.requests, "post", fake_post)
+
+
+def test_push_enabled_requires_both(monkeypatch):
+    assert mpb.push_enabled() is False
+    monkeypatch.setattr(mpb, "MP_APPID", "wx_test_appid")
+    assert mpb.push_enabled() is False  # 只有 AppID 不够
+    monkeypatch.setattr(mpb, "MP_APPSECRET", "test-secret")
+    assert mpb.push_enabled() is True
+    monkeypatch.setattr(mpb, "MP_APPID", "")
+    assert mpb.push_enabled() is False  # 只有 Secret 也不够
+
+
+def test_placeholder_push_mode_no_continue_hint(monkeypatch):
+    _enable_push(monkeypatch)
+    text = mpb._placeholder_text()
+    assert text == "请稍等，查询中。。。"
+    assert "继续" not in text
+    assert "\n" not in text  # 推送开启时只有一行，粉丝只管等
+
+
+def test_placeholder_no_push_has_continue_hint():
+    assert mpb._placeholder_text() == "请稍等，查询中。。。\n（稍后发“继续”查看结果）"
+
+
+def test_get_access_token_caches(monkeypatch):
+    _enable_push(monkeypatch)
+    calls = {"n": 0}
+    _mock_token(monkeypatch, calls)
+    assert mpb.get_access_token() == "test-access-token"
+    assert mpb.get_access_token() == "test-access-token"
+    assert calls["n"] == 1  # 第二次走缓存，不再发请求
+    mpb._reset_token_cache()
+    assert mpb.get_access_token() == "test-access-token"
+    assert calls["n"] == 2
+
+
+def test_get_access_token_disabled_no_request(monkeypatch):
+    # 没配 AppID/Secret：不发任何请求，直接 None
+    monkeypatch.setattr(mpb.requests, "get",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("should not call")))
+    assert mpb.get_access_token() is None
+    assert mpb.push_custom_message("user_openid_abc", "hi") is False
+
+
+def test_get_access_token_failure_returns_none(monkeypatch):
+    _enable_push(monkeypatch)
+    monkeypatch.setattr(mpb.requests, "get",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("net down")))
+    assert mpb.get_access_token() is None
+
+
+def test_push_custom_message_success(monkeypatch):
+    _enable_push(monkeypatch)
+    _mock_token(monkeypatch)
+    calls = {"n": 0}
+    _mock_push_post(monkeypatch, calls)
+    assert mpb.push_custom_message("user_openid_abc", "答案在这里。") is True
+    assert calls["n"] == 1
+    assert calls["payload"]["touser"] == "user_openid_abc"
+    assert calls["payload"]["msgtype"] == "text"
+    assert calls["payload"]["text"]["content"] == "答案在这里。"
+
+
+def test_push_custom_message_48001_failure(monkeypatch):
+    # 未认证的号调客服接口会报 48001：不重试、不抛异常，返回 False
+    _enable_push(monkeypatch)
+    _mock_token(monkeypatch)
+    calls = {"n": 0}
+    _mock_push_post(monkeypatch, calls, errcode=48001, errmsg="api unauthorized")
+    assert mpb.push_custom_message("user_openid_abc", "答案在这里。") is False
+    assert calls["n"] == 1  # 只试一次，不循环重试
+
+
+def test_slow_path_pushes_answer_when_enabled(client, monkeypatch):
+    _enable_push(monkeypatch)
+    _mock_token(monkeypatch)
+    push_calls = {"n": 0}
+    _mock_push_post(monkeypatch, push_calls)
+    monkeypatch.setattr(mpb, "LLM_FIRST_WAIT_SEC", 0.1)
+    monkeypatch.setattr(mpb, "LLM_TIMEOUT_SEC", 5)
+    _mock_slow_llm(monkeypatch, 0.5, "慢模型答案：bridge 是默认模式。")
+    r = _post_text(client, "Docker 网络模式有哪些")
+    assert r.status_code == 200
+    body = r.get_data(as_text=True)
+    assert "请稍等，查询中。。。" in body
+    assert "继续" not in body  # 推送开启，占位提示里不提“继续”
+    time.sleep(0.8)  # 等后台跑完 + 推送
+    assert push_calls["n"] == 1
+    assert push_calls["payload"]["text"]["content"] == "慢模型答案：bridge 是默认模式。"
+    # 答案照样缓存着，粉丝发“继续”也能拿到（安全网）
+    assert "慢模型答案" in _post_text(client, "继续").get_data(as_text=True)
+
+
+def test_fast_path_does_not_push(client, monkeypatch):
+    _enable_push(monkeypatch)
+    _mock_token(monkeypatch)
+    push_calls = {"n": 0}
+    _mock_push_post(monkeypatch, push_calls)
+    monkeypatch.setattr(mpb, "call_llm", lambda q, c: "bridge 是默认模式。")
+    r = _post_text(client, "Docker 网络模式有哪些")
+    assert "bridge 是默认模式" in r.get_data(as_text=True)
+    assert "请稍等，查询中。。。" not in r.get_data(as_text=True)
+    time.sleep(0.3)  # 后台线程跑完宽限期
+    assert push_calls["n"] == 0  # 快路径直接回了答案，不再重复推
+
+
+def test_push_failure_falls_back_to_continue(client, monkeypatch):
+    _enable_push(monkeypatch)
+    _mock_token(monkeypatch)
+    push_calls = {"n": 0}
+    _mock_push_post(monkeypatch, push_calls, errcode=48001, errmsg="api unauthorized")
+    monkeypatch.setattr(mpb, "LLM_FIRST_WAIT_SEC", 0.1)
+    monkeypatch.setattr(mpb, "LLM_TIMEOUT_SEC", 5)
+    _mock_slow_llm(monkeypatch, 0.5, "慢模型答案。")
+    assert "请稍等，查询中。。。" in _post_text(client, "Docker 网络模式有哪些").get_data(as_text=True)
+    time.sleep(0.8)
+    assert push_calls["n"] == 1  # 推过一次，失败了
+    # 推送失败也不丢答案，“继续”照样能取到
+    assert "慢模型答案" in _post_text(client, "继续").get_data(as_text=True)
+
+
+def test_slow_path_no_push_when_disabled_makes_no_token_request(client, monkeypatch):
+    # 推送关闭时，后台跑完也不调 token 接口
+    monkeypatch.setattr(mpb.requests, "get",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("should not call")))
+    monkeypatch.setattr(mpb, "LLM_FIRST_WAIT_SEC", 0.1)
+    monkeypatch.setattr(mpb, "LLM_TIMEOUT_SEC", 5)
+    _mock_slow_llm(monkeypatch, 0.5, "慢模型答案。")
+    assert "请稍等，查询中。。。" in _post_text(client, "Docker 网络模式有哪些").get_data(as_text=True)
+    time.sleep(0.8)
+    assert "慢模型答案" in _post_text(client, "继续").get_data(as_text=True)
+
+
+def test_answer_question_uses_top2_chunks(monkeypatch, index):
+    # v1.4：检索只取前 2 块，提示词更小、回得更快
+    captured = {}
+
+    def fake_call(q, c):
+        captured["n"] = len(c)
+        return "ok"
+    monkeypatch.setattr(mpb, "call_llm", fake_call)
+    ans = mpb.answer_question("Docker 网络模式有哪些", index, user_hash="u-top2")
+    assert ans == "ok"
+    assert captured["n"] == 2
+
+
+def test_call_llm_truncates_context_chunks_to_800(monkeypatch):
+    # v1.4：每块上下文截到 800 字，2000 字的块不会原样塞进提示词
+    captured = {}
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        captured["user"] = json["messages"][1]["content"]
+        return _FakeResp({"choices": [{"message": {"content": "ok"}}]})
+    monkeypatch.setattr(mpb, "LLM_API_KEY", "test-key")
+    monkeypatch.setattr(mpb, "LLM_MODEL", "deepseek-chat")
+    monkeypatch.setattr(mpb.requests, "post", fake_post)
+    long_chunk = {"source": "x.md", "heading": "h", "text": "A" * 2000}
+    mpb.call_llm("问题", [long_chunk])
+    assert captured["user"].count("A") == 800
+
+
+def test_health_push_enabled_true(monkeypatch, client):
+    _enable_push(monkeypatch)
+    data = client.get("/health").get_json()
+    assert data["push_enabled"] is True
+    assert data["llm_max_tokens"] == 400
+
+# ---------------- v1.4 新关注门禁 ----------------
+# 用量记录写进临时文件（autouse fixture 已把 USAGE_FILE 指到 /tmp），
+# 不碰仓库 data/usage.json。subscribe 事件是门禁计时的唯一可信来源；
+# 转发 5 篇微信不给服务器发、也没接口可查，所以只写在提示里、不自动数。
+
+def _event_xml(event, from_user="user_openid_abc", to_user="gh_test"):
+    return (
+        "<xml>"
+        f"<ToUserName><![CDATA[{to_user}]]></ToUserName>"
+        f"<FromUserName><![CDATA[{from_user}]]></FromUserName>"
+        "<CreateTime>1700000000</CreateTime>"
+        f"<MsgType><![CDATA[event]]></MsgType>"
+        f"<Event><![CDATA[{event}]]></Event>"
+        "</xml>"
+    )
+
+
+def _post_event(client, event, from_user="user_openid_abc"):
+    return client.post("/mp/callback", data=_event_xml(event, from_user),
+                       content_type="application/xml")
+
+
+def _usage_data():
+    with open(mpb.USAGE_FILE, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _seed_usage(user_hash, subscribe_days_ago=0, question_count=0, unlocked=False):
+    entry = {
+        "subscribe_time": time.time() - subscribe_days_ago * 86400,
+        "subscribed": True,
+        "question_count": question_count,
+        "unlocked": unlocked,
+        "first_question_at": time.time() - subscribe_days_ago * 86400,
+    }
+    with open(mpb.USAGE_FILE, "w", encoding="utf-8") as f:
+        json.dump({user_hash: entry}, f, ensure_ascii=False)
+
+
+def test_subscribe_event_records_time_and_welcomes(client):
+    r = _post_event(client, "subscribe")
+    assert r.status_code == 200
+    body = r.get_data(as_text=True)
+    assert "欢迎关注网络小徒" in body
+    assert "免费提问一次" in body
+    assert "转发5篇" in body
+    uh = mpb._user_hash("user_openid_abc")
+    data = _usage_data()
+    assert uh in data
+    assert data[uh]["subscribed"] is True
+    assert abs(data[uh]["subscribe_time"] - time.time()) < 5
+
+
+def test_first_question_allowed_second_gated(client, monkeypatch):
+    calls = {"n": 0}
+
+    def fake_call(q, c):
+        calls["n"] += 1
+        return "答案。"
+    monkeypatch.setattr(mpb, "call_llm", fake_call)
+    r1 = _post_text(client, "Docker 网络模式有哪些")
+    assert "答案" in r1.get_data(as_text=True)
+    assert calls["n"] == 1
+    # 第二个问题：门禁拦住，大模型根本没调
+    r2 = _post_text(client, "K8s Service 是什么")
+    body = r2.get_data(as_text=True)
+    assert "新关注用户仅可免费提问一次" in body
+    assert "关注满一星期并转发5篇文章后" in body
+    assert "还差7天" in body
+    assert calls["n"] == 1
+
+
+def test_gate_message_days_remaining(monkeypatch, index):
+    uh = "u-days"
+    _seed_usage(uh, subscribe_days_ago=2, question_count=1)
+    ans = mpb.answer_question("K8s Service 是什么", index, user_hash=uh)
+    assert "你已关注2天，还差5天" in ans
+
+
+def test_seven_day_old_user_unlimited(client, monkeypatch):
+    uh = mpb._user_hash("user_openid_abc")
+    _seed_usage(uh, subscribe_days_ago=8, question_count=5)
+    calls = {"n": 0}
+    monkeypatch.setattr(mpb, "call_llm", lambda q, c: (calls.__setitem__("n", calls["n"] + 1), "答案。")[1])
+    assert "答案" in _post_text(client, "Docker 网络模式有哪些").get_data(as_text=True)
+    assert "答案" in _post_text(client, "K8s Service 是什么").get_data(as_text=True)
+    assert calls["n"] == 2
+
+
+def test_exactly_seven_days_unlocks(monkeypatch, index):
+    uh = "u-7d"
+    _seed_usage(uh, subscribe_days_ago=7, question_count=1)
+    monkeypatch.setattr(mpb, "call_llm", lambda q, c: "答案。")
+    assert mpb.answer_question("K8s Service 是什么", index, user_hash=uh) == "答案。"
+
+
+def test_admin_unlock_allows_second_question(client, monkeypatch):
+    uh = mpb._user_hash("user_openid_abc")
+    _seed_usage(uh, subscribe_days_ago=0, question_count=1)
+    monkeypatch.setattr(mpb, "call_llm", lambda q, c: "答案。")
+    assert "仅可免费提问一次" in _post_text(client, "K8s Service 是什么").get_data(as_text=True)
+    r = client.post("/admin/unlock", json={"openid": "user_openid_abc"},
+                    headers={"X-Admin-Token": "admin-secret-test"})
+    assert r.status_code == 200
+    assert r.get_json()["unlocked"] is True
+    assert _usage_data()[uh]["unlocked"] is True
+    assert "答案" in _post_text(client, "K8s Service 是什么").get_data(as_text=True)
+
+
+def test_admin_unlock_unauthorized(client):
+    r = client.post("/admin/unlock", json={"openid": "user_openid_abc"})
+    assert r.status_code == 401
+    r = client.post("/admin/unlock", json={"openid": "user_openid_abc"},
+                    headers={"X-Admin-Token": "wrong"})
+    assert r.status_code == 401
+    r = client.post("/admin/unlock", json={},
+                    headers={"X-Admin-Token": "admin-secret-test"})
+    assert r.status_code == 400
+
+
+def test_gated_user_continue_still_works(client, monkeypatch):
+    # 第一问是免费那次：慢模型 -> 占位 -> “继续”拿答案，门禁不拦“继续”
+    monkeypatch.setattr(mpb, "LLM_FIRST_WAIT_SEC", 0.1)
+    monkeypatch.setattr(mpb, "LLM_TIMEOUT_SEC", 5)
+    _mock_slow_llm(monkeypatch, 0.5, "慢模型答案。")
+    assert "请稍等，查询中。。。" in _post_text(client, "Docker 网络模式有哪些").get_data(as_text=True)
+    time.sleep(0.7)
+    assert "慢模型答案" in _post_text(client, "继续").get_data(as_text=True)
+    # 免费次数已用完，再问新问题被拦住
+    assert "仅可免费提问一次" in _post_text(client, "K8s Service 是什么").get_data(as_text=True)
+
+
+def test_help_bypasses_gating(client, monkeypatch):
+    uh = mpb._user_hash("user_openid_abc")
+    _seed_usage(uh, subscribe_days_ago=0, question_count=1)
+    calls = {"n": 0}
+    monkeypatch.setattr(mpb, "call_llm", lambda q, c: (calls.__setitem__("n", calls["n"] + 1), "答案。")[1])
+    r = _post_text(client, "帮助")
+    assert "TCP 三次握手" in r.get_data(as_text=True)
+    assert calls["n"] == 0  # 帮助不算提问，不调大模型
+    assert _usage_data()[uh]["question_count"] == 1  # 次数也没变
+    # 帮助之后再问新问题，照样被拦住
+    assert "仅可免费提问一次" in _post_text(client, "K8s Service 是什么").get_data(as_text=True)
+
+
+def test_unsubscribe_resubscribe_keeps_earliest(client, monkeypatch):
+    uh = mpb._user_hash("user_openid_abc")
+    _post_event(client, "subscribe")
+    first_time = _usage_data()[uh]["subscribe_time"]
+    monkeypatch.setattr(mpb, "call_llm", lambda q, c: "答案。")
+    assert "答案" in _post_text(client, "Docker 网络模式有哪些").get_data(as_text=True)
+    assert _usage_data()[uh]["question_count"] == 1
+    _post_event(client, "unsubscribe")
+    assert _usage_data()[uh]["subscribed"] is False
+    time.sleep(0.05)
+    _post_event(client, "subscribe")
+    data = _usage_data()[uh]
+    assert data["subscribed"] is True
+    assert data["subscribe_time"] == first_time  # 不重置关注时间
+    assert data["question_count"] == 1  # 不重置提问次数，防取关重关刷次数
+    assert "仅可免费提问一次" in _post_text(client, "K8s Service 是什么").get_data(as_text=True)
+
+
+def test_corrupt_usage_file_no_crash(client, monkeypatch):
+    with open(mpb.USAGE_FILE, "w", encoding="utf-8") as f:
+        f.write("{not json at all")
+    monkeypatch.setattr(mpb, "call_llm", lambda q, c: "答案。")
+    r = _post_text(client, "Docker 网络模式有哪些")
+    assert r.status_code == 200
+    assert "答案" in r.get_data(as_text=True)  # 损坏文件从空开始，第一问照常放行
+
+
+def test_first_question_without_subscribe_event_uses_first_seen(monkeypatch, index):
+    # 部署前就关注的用户：没收到过 subscribe 事件，按首次提问时间起算
+    monkeypatch.setattr(mpb, "call_llm", lambda q, c: "答案。")
+    assert mpb.answer_question("Docker 网络模式有哪些", index, user_hash="u-early") == "答案。"
+    data = _usage_data()
+    assert "u-early" in data
+    assert abs(data["u-early"]["subscribe_time"] - time.time()) < 5
+    assert data["u-early"]["question_count"] == 1
+
+
+def test_health_gated_users(client, monkeypatch):
+    uh = mpb._user_hash("user_openid_abc")
+    _seed_usage(uh, subscribe_days_ago=0, question_count=0)
+    data = client.get("/health").get_json()
+    assert data["gating_enabled"] is True
+    assert data["gated_users"] == 1
+    # 解锁后不再计入
+    client.post("/admin/unlock", json={"openid": "user_openid_abc"},
+                headers={"X-Admin-Token": "admin-secret-test"})
+    assert client.get("/health").get_json()["gated_users"] == 0
