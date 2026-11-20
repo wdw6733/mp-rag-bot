@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""公众号轻量 RAG 机器人 v1.3.1。
+"""公众号轻量 RAG 机器人 v1.4.0。
 
 服务号（未微信认证）发文字消息 -> 微信 POST 到 /mp/callback ->
 检索 knowledge/ 里的 Markdown 作参考 -> 调用户自配的大模型综合回答 ->
@@ -23,15 +23,27 @@
 两步：先在后台线程调大模型，主请求只等 LLM_FIRST_WAIT_SEC（默认 4 秒）；
 等到了直接回答案，等不到先回一句“请稍等，查询中。。。”，后台继续跑到
 LLM_TIMEOUT_SEC（默认 20 秒），结果缓存在内存里，粉丝再发“继续”或重发
-同样的问题就能拿到答案。未认证的号没有客服消息，机器人不能主动再推
-一条消息，只能等粉丝再发一条消息来取结果——这是这个号能做到的上限，
-认证（300 元/年）后才能用客服消息直接把答案推过去。
+同样的问题就能拿到答案。
+
+不用“继续”（v1.4，两条路）：
+- 大多数问题：回答变短变快（LLM_MAX_TOKENS 默认 400、检索只取前 2 块、
+  每块上下文截到 800 字），4 秒内直接回答案，粉丝什么都不用多做。
+- 慢回答自动推：配了 MP_APPID / MP_APPSECRET（需要微信认证，300 元/年）
+  才能用客服消息，后台查完直接把答案推给粉丝，占位提示里也不再提“继续”。
+  没认证、没配这两个值时，客服推送是关着的，慢回答还是靠“继续”来取——
+  这是未认证的号能做到的上限，不是机器人不想推，是微信不让推。
 
 未认证服务号的限制（v1.1 不做、也做不了）：
 - 只有 5 秒内被动回复，没有 48 小时客服消息；
 - 服务器配置启用后，自定义菜单不可用。
 认证（300 元/年）后才能用客服消息突破 5 秒、才能用自定义菜单，
-那是可选的后续升级，不是 v1.3 的必需项。
+v1.4 已接客服消息（配 MP_APPID / MP_APPSECRET 即开启），菜单仍未接。
+
+新关注门禁（v1.4）：刚关注不满 7 天的用户只能免费问一次，第二问起
+回门禁提示（关注满一星期并转发 5 篇文章后正常用）。关注时间靠微信
+发来的 subscribe 事件记录；转发数微信不给服务器发、也没接口可查，
+所以转发 5 篇是写在提示里的规则、靠信任，管理员可用 /admin/unlock
+手动提前解锁。没关注的人根本发不了消息，不存在“没关注还提问”的情况。
 
 凭证与模型只从环境变量读，绝不写进代码、README、日志。
 模型不固定：LLM_API_BASE / LLM_API_KEY / LLM_MODEL 由用户在 .env 里
@@ -40,6 +52,7 @@ LLM_TIMEOUT_SEC（默认 20 秒），结果缓存在内存里，粉丝再发“�
 绝不记 Key / Authorization 头。
 """
 import hashlib
+import json
 import os
 import threading
 import time
@@ -50,15 +63,21 @@ from flask import Flask, request
 
 from retrieval import KnowledgeIndex
 
-VERSION = "1.3.1"
+VERSION = "1.4.0"
 PORT = int(os.environ.get("MP_PORT", "18790"))
 KNOWLEDGE_DIR = os.environ.get(
     "KNOWLEDGE_DIR",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "knowledge"),
 )
 MP_TOKEN = os.environ.get("MP_TOKEN", "").strip()
-# MP_APPID / MP_APPSECRET：v1.1 不需要。客服消息接口没接（未认证服务号
-# 本来也用不了），不要在 .env 里配这两个。
+# v1.4 客服推送（可选，默认关闭）：MP_APPID / MP_APPSECRET 都配了才开启。
+# 只有微信认证过的号才能调客服消息接口；未认证的号留空，慢回答靠“继续”取。
+# AppID / AppSecret 在微信开发者平台 -> 我的业务 -> 公众号 -> 基础信息里找。
+MP_APPID = os.environ.get("MP_APPID", "").strip()
+MP_APPSECRET = os.environ.get("MP_APPSECRET", "").strip()
+# access_token 内存缓存：{"token": ..., "expires_at": monotonic 秒}
+_TOKEN_CACHE = {"token": None, "expires_at": 0.0}
+_TOKEN_LOCK = threading.Lock()
 LLM_API_BASE = os.environ.get("LLM_API_BASE", "https://anyrouter.top/v1").strip() or "https://anyrouter.top/v1"
 LLM_API_KEY = os.environ.get("LLM_API_KEY", "").strip()
 # 模型不固定：LLM_MODEL 留空 = 自动模式（默认），见 discover_models()。
@@ -99,7 +118,9 @@ def _float_env(name, default):
 #   否则等不到答案、占位提示也发不出去，粉丝什么都收不到。
 LLM_TIMEOUT_SEC = _int_env("LLM_TIMEOUT_SEC", 20)
 LLM_FIRST_WAIT_SEC = _float_env("LLM_FIRST_WAIT_SEC", 4)
-LLM_MAX_TOKENS = _int_env("LLM_MAX_TOKENS", 800)
+# v1.4：默认 400（原来 800）。回答短了生成就快，4 秒内直接回完的概率更高；
+# 系统提示词本来就要求 1000 字内、优先给结论，400 tokens 够用。想长回答再调大。
+LLM_MAX_TOKENS = _int_env("LLM_MAX_TOKENS", 400)
 ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "").strip()
 MAX_ANSWER_CHARS = 1000  # 5 秒被动回复要短：截断到约 1000 字（v1.0 是 1800）
 
@@ -140,8 +161,236 @@ _JOB_TTL_SEC = 600  # 查询结果保留 10 分钟，过期就丢掉
 _JOBS = {}
 _JOBS_LOCK = threading.Lock()
 
+# v1.4 新关注门禁：用量记录持久化在 JSON 文件里，重启不丢。
+# 容器里是挂载的 /data/usage.json（compose 已挂 ./data:/data），本地开发
+# 时是仓库 data/usage.json；USAGE_FILE / DATA_DIR 环境变量可改。
+# 键是 openid 的前 8 位哈希（和日志一致，不存完整 openid），值：
+# {"subscribe_time": 关注时间 epoch 秒, "subscribed": 是否在关注,
+#  "question_count": 提问次数, "unlocked": 是否已解锁,
+#  "first_question_at": 首次提问时间 epoch 秒|None}。
+_DATA_DIR = os.environ.get(
+    "DATA_DIR",
+    "/data" if os.path.isdir("/data")
+    else os.path.join(os.path.dirname(os.path.abspath(__file__)), "data"))
+USAGE_FILE = os.environ.get("USAGE_FILE", os.path.join(_DATA_DIR, "usage.json"))
+_USAGE_LOCK = threading.Lock()
+_GATE_DAYS = 7
+_GATE_SECONDS = _GATE_DAYS * 86400
+GATE_MESSAGE = ("新关注用户仅可免费提问一次。"
+                "关注满一星期并转发5篇文章后，即可正常使用大模型问答。")
+WELCOME_TEXT = ("欢迎关注网络小徒！直接发问题就行。"
+                "新关注用户可免费提问一次，关注满一星期并转发5篇文章后"
+                "即可正常使用大模型问答。")
+
+
+def _load_usage():
+    """读用量文件；缺失返回 {}，损坏记一条日志后从空开始，绝不崩。"""
+    try:
+        with open(USAGE_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as e:
+        log("用量记录损坏，从空开始：", type(e).__name__, str(e)[:200])
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _save_usage(data):
+    """写用量文件：先写临时文件再 rename，原子替换；失败只记日志。"""
+    try:
+        os.makedirs(os.path.dirname(USAGE_FILE) or ".", exist_ok=True)
+        tmp = USAGE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        os.replace(tmp, USAGE_FILE)
+    except OSError as e:
+        log("用量记录保存失败：", type(e).__name__, str(e)[:200])
+
+
+def _usage_entry(data, user_hash):
+    entry = data.get(user_hash)
+    if not isinstance(entry, dict):
+        entry = {}
+        data[user_hash] = entry
+    return entry
+
+
+def record_subscribe(user_hash):
+    """关注事件：记关注时间。重复关注不重置——保留最早的关注时间和已有的
+    提问次数，防止取关再关注刷免费次数。"""
+    now = time.time()
+    with _USAGE_LOCK:
+        data = _load_usage()
+        entry = _usage_entry(data, user_hash)
+        if not entry.get("subscribe_time"):
+            entry["subscribe_time"] = now
+        entry["subscribed"] = True
+        _save_usage(data)
+    log("用户关注 user=", user_hash)
+
+
+def record_unsubscribe(user_hash):
+    """取关事件：只把 subscribed 置 False，记录保留；再关注时不重置。"""
+    with _USAGE_LOCK:
+        data = _load_usage()
+        entry = _usage_entry(data, user_hash)
+        entry["subscribed"] = False
+        _save_usage(data)
+    log("用户取关 user=", user_hash)
+
+
+def unlock_user(openid):
+    """管理员手动解锁：POST /admin/unlock 用。返回用户哈希。"""
+    user_hash = _user_hash(openid)
+    now = time.time()
+    with _USAGE_LOCK:
+        data = _load_usage()
+        entry = _usage_entry(data, user_hash)
+        entry["unlocked"] = True
+        entry.setdefault("subscribe_time", now)
+        _save_usage(data)
+    log("用户已手动解锁 user=", user_hash)
+    return user_hash
+
+
+def _check_gate(user_hash):
+    """门禁检查，返回 (allowed, gate_message)。
+
+    未解锁且关注不满 7 天的用户只有一次免费提问：第一次放行并计数，
+    第二次起拦住，不调大模型、不开异步任务。满 7 天自动解锁，不用定时任务。
+    没有记录的用户（部署前就关注了、没收到过 subscribe 事件）把首次提问
+    时间当作关注时间起算，并记一条日志说明这个假设。
+    """
+    now = time.time()
+    with _USAGE_LOCK:
+        data = _load_usage()
+        entry = _usage_entry(data, user_hash)
+        if not entry.get("subscribe_time"):
+            entry["subscribe_time"] = now
+            log("未见过关注事件，按首次提问时间起算关注期 user=", user_hash)
+        entry.setdefault("question_count", 0)
+        entry.setdefault("unlocked", False)
+        count = int(entry.get("question_count") or 0)
+        if entry.get("unlocked") or now - float(entry["subscribe_time"]) >= _GATE_SECONDS:
+            entry["question_count"] = count + 1
+            _save_usage(data)
+            return True, None
+        if count == 0:
+            entry["question_count"] = 1
+            entry["first_question_at"] = entry.get("first_question_at") or now
+            _save_usage(data)
+            return True, None
+        days = int((now - float(entry["subscribe_time"])) // 86400)
+        remaining = max(1, _GATE_DAYS - days)
+        _save_usage(data)
+        return False, f"{GATE_MESSAGE}（你已关注{days}天，还差{remaining}天）"
+
+
+def _gated_users_count():
+    """当前还在 7 天门禁期内、未解锁的用户数（/health 用）。"""
+    now = time.time()
+    with _USAGE_LOCK:
+        data = _load_usage()
+    n = 0
+    for entry in data.values():
+        if not isinstance(entry, dict) or entry.get("unlocked"):
+            continue
+        st = entry.get("subscribe_time")
+        if st and now - float(st) < _GATE_SECONDS:
+            n += 1
+    return n
+
+
+def push_enabled():
+    """客服推送是否开启：MP_APPID 和 MP_APPSECRET 都配了才算开。"""
+    return bool(MP_APPID and MP_APPSECRET)
+
+
+def _reset_token_cache():
+    """清空 access_token 缓存：测试用，生产代码不调。"""
+    with _TOKEN_LOCK:
+        _TOKEN_CACHE["token"] = None
+        _TOKEN_CACHE["expires_at"] = 0.0
+
+
+def get_access_token():
+    """拿微信 access_token（client_credential 模式），内存缓存，提前 60 秒刷新。
+
+    未开启推送时不发任何请求，直接返回 None。token / secret 绝不记日志。
+    失败返回 None，不抛异常，调用方走“继续”取结果的兜底。
+    """
+    if not push_enabled():
+        return None
+    now = time.monotonic()
+    with _TOKEN_LOCK:
+        if _TOKEN_CACHE["token"] and now < _TOKEN_CACHE["expires_at"] - 60:
+            return _TOKEN_CACHE["token"]
+    try:
+        resp = requests.get(
+            "https://api.weixin.qq.com/cgi-bin/token",
+            params={"grant_type": "client_credential",
+                    "appid": MP_APPID, "secret": MP_APPSECRET},
+            timeout=5,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        log("获取 access_token 失败：", type(e).__name__, _error_body(e)[:200])
+        return None
+    token = data.get("access_token") if isinstance(data, dict) else None
+    if not token:
+        log("获取 access_token 失败：", str(data)[:200])
+        return None
+    try:
+        expires_in = int(data.get("expires_in") or 7200)
+    except (TypeError, ValueError):
+        expires_in = 7200
+    with _TOKEN_LOCK:
+        _TOKEN_CACHE["token"] = token
+        _TOKEN_CACHE["expires_at"] = time.monotonic() + expires_in
+    return token
+
+
+def push_custom_message(openid, content, user_hash=None):
+    """客服消息推送：后台查完把答案直接推给粉丝。
+
+    成功返回 True。任何失败（未认证 errcode 48001、token 失效、超时等）
+    都只记一条日志、不循环重试，返回 False，调用方仍把答案缓存下来，
+    粉丝发“继续”照样能拿到。openid 只记前 8 位哈希，不记全值。
+    """
+    if not push_enabled() or not openid:
+        return False
+    token = get_access_token()
+    if not token:
+        return False
+    uh = user_hash or _user_hash(openid)
+    try:
+        resp = requests.post(
+            "https://api.weixin.qq.com/cgi-bin/message/custom/send",
+            params={"access_token": token},
+            json={"touser": openid, "msgtype": "text",
+                  "text": {"content": content}},
+            timeout=5,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        log("客服消息推送失败 user=", uh, "：",
+            type(e).__name__, _error_body(e)[:200])
+        return False
+    if isinstance(data, dict) and data.get("errcode") == 0:
+        log("客服消息已推送 user=", uh, "len=", len(content))
+        return True
+    log("客服消息推送失败 user=", uh, "：", str(data)[:200])
+    return False
+
 
 def _placeholder_text():
+    """占位提示（v1.4）：推送开启时只有一行，粉丝只管等，答案会自己推过来；
+    未开启时保留第二行“继续”提示，慢回答靠“继续”取。"""
+    if push_enabled():
+        return "请稍等，查询中。。。"
     return "请稍等，查询中。。。\n（稍后发“继续”查看结果）"
 
 
@@ -203,6 +452,7 @@ def parse_mp_message(xml_text):
         "msg_type": _xml_text(root, "MsgType"),
         "content": _xml_text(root, "Content"),
         "msg_id": _xml_text(root, "MsgId"),
+        "event": _xml_text(root, "Event"),
     }
 
 
@@ -387,8 +637,11 @@ def call_llm(question, chunks):
         raise RuntimeError("LLM_API_KEY 未配置")
     deadline = time.monotonic() + LLM_TIMEOUT_SEC
     if chunks:
+        # v1.4：每块上下文截到 800 字。提示词小了，大模型回得更快；
+        # 摘录兜底（extractive_fallback）仍用完整块，不受这里影响。
         context = "\n\n---\n\n".join(
-            f"【{c['source']} / {c['heading']}】\n{c['text']}" for c in chunks
+            f"【{c['source']} / {c['heading']}】\n{c['text'][:800]}"
+            for c in chunks
         )
         user_content = f"知识库摘录（仅供参考）：\n{context}\n\n问题：{question}"
     else:
@@ -502,7 +755,7 @@ def _reset_jobs():
         _JOBS.clear()
 
 
-def _start_job(user_hash, question, question_norm):
+def _start_job(user_hash, question, question_norm, openid=None):
     job = {
         "question": question,
         "question_norm": question_norm,
@@ -511,6 +764,11 @@ def _start_job(user_hash, question, question_norm):
         "created_at": time.monotonic(),
         "done_event": threading.Event(),
         "thread": None,
+        # v1.4 客服推送用：openid 只放内存、不写文件、不记日志；
+        # slow_path：主请求等超时后才置 True（慢路径）；taken：快路径取走答案时置 True。
+        "openid": openid,
+        "slow_path": False,
+        "taken": False,
     }
     with _JOBS_LOCK:
         _prune_jobs_locked()
@@ -538,22 +796,34 @@ def _run_job(job, user_hash, question, chunks):
         job["answer"] = answer
         still_current = _JOBS.get(user_hash) is job
     job["done_event"].set()
+    # v1.4 自动推送：只在慢路径推。快路径里主请求被 done_event 唤醒后
+    # 直接把答案当被动回复发走，slow_path 永远不会置 True，所以不会重复推；
+    # 慢路径里主请求早已超时、置了 slow_path 并回了占位提示，这里才推。
+    # 推送失败也不影响缓存，粉丝发“继续”照样能拿到答案。
+    # 50ms 宽限：答案恰好在首答超时前后回完时，等主请求那边把
+    # slow_path / taken 标记写定，避免竞态下该推的没推、该直回的重复推。
+    time.sleep(0.05)
+    if (still_current and job.get("slow_path") and not job.get("taken")
+            and job.get("openid") and push_enabled()):
+        push_custom_message(job["openid"], answer, user_hash)
     if still_current:
         log("异步结果已缓存 user=", user_hash, "len=", len(answer))
     else:
         log("异步结果已丢弃（被新问题取代）user=", user_hash)
 
 
-def answer_question(question, index, user_hash="anon"):
-    """问答主流程（v1.3 异步）：检索作参考 -> 后台调大模型。
+def answer_question(question, index, user_hash="anon", openid=None):
+    """问答主流程（v1.3 异步 + v1.4 推送）：检索作参考 -> 后台调大模型。
 
     快路径：大模型在 LLM_FIRST_WAIT_SEC（默认 4 秒）内回完，直接回答案，
     和 v1.2 一样；任务随即清除，之后再发“继续”只会回帮助。
     慢路径：4 秒没回完，先回占位提示“请稍等，查询中。。。”，后台继续跑到
-    LLM_TIMEOUT_SEC（默认 20 秒）；结果缓存 10 分钟，粉丝发“继续”或重发
-    同样的问题来取。重发同样的问题、且任务还在跑时不重复开任务。
-    “继续”类命令：有已完成的任务就取走答案并清除；还在跑就回“还在查询”；
-    没有任务就回帮助。检索不到不拦路，失败兜底逻辑与 v1.2 相同。
+    LLM_TIMEOUT_SEC（默认 20 秒）；推送开启时后台查完直接把答案推给粉丝，
+    占位提示里不提“继续”；没开启时结果缓存 10 分钟，粉丝发“继续”或重发
+    同样的问题来取，推送失败也一样能靠“继续”取到。重发同样的问题、且
+    任务还在跑时不重复开任务。“继续”类命令：有已完成的任务就取走答案并
+    清除；还在跑就回“还在查询”；没有任务就回帮助。检索不到不拦路，
+    失败兜底逻辑与 v1.2 相同。v1.4 检索只取前 2 块，提示词更小、回得更快。
     """
     if _is_continue_command(question):
         job = _get_job(user_hash)
@@ -572,21 +842,30 @@ def answer_question(question, index, user_hash="anon"):
         answer = job["answer"]
         _clear_job(user_hash, job)
         return answer
-    chunks = index.search(question, top_n=3)
+    # v1.4 门禁：新关注 7 天内只有一次免费提问。被拦住时不调大模型、
+    # 不开异步任务，直接回门禁提示。“继续”取结果和重发原问题在上面
+    # 已经处理过，不走这里，所以不会误拦。
+    gate_ok, gate_msg = _check_gate(user_hash)
+    if not gate_ok:
+        log("新关注用户超限，拦住提问 user=", user_hash)
+        return gate_msg
+    chunks = index.search(question, top_n=2)
     log("提问 len=", len(question), "命中：",
         ", ".join(f"{c['source']}#{c['heading']}" for c in chunks) or "无")
     if job is not None:
         log("新问题取代旧查询 user=", user_hash)
-    job = _start_job(user_hash, question, norm)
+    job = _start_job(user_hash, question, norm, openid=openid)
     thread = threading.Thread(
         target=_run_job, args=(job, user_hash, question, chunks),
         daemon=True)
     job["thread"] = thread
     thread.start()
     if job["done_event"].wait(timeout=_first_wait_sec()):
+        job["taken"] = True
         answer = job["answer"]
         _clear_job(user_hash, job)
         return answer
+    job["slow_path"] = True
     log("提问 len=", len(question), "异步查询中 user=", user_hash)
     return _placeholder_text()
 
@@ -609,6 +888,10 @@ def health():
             "llm_mode": llm_mode, "llm_model": llm_model,
             "llm_timeout_sec": LLM_TIMEOUT_SEC,
             "llm_first_wait_sec": _first_wait_sec(),
+            "llm_max_tokens": LLM_MAX_TOKENS,
+            "push_enabled": push_enabled(),
+            "gating_enabled": True,
+            "gated_users": _gated_users_count(),
             "async_jobs": active_jobs}
 
 
@@ -641,18 +924,34 @@ def mp_callback():
     except ValueError as e:
         log("消息 XML 解析失败：", str(e)[:200])
         return "", 200
+    user_hash = _user_hash(msg["from_user"])
+    if msg["msg_type"] == "event":
+        # v1.4 门禁靠关注事件计时：subscribe 记关注时间并回欢迎语，
+        # unsubscribe 只记取关、保留记录；其他事件不回。
+        event = (msg.get("event") or "").strip().lower()
+        if event == "subscribe":
+            record_subscribe(user_hash)
+            return build_text_reply(msg["from_user"], msg["to_user"],
+                                    WELCOME_TEXT), 200, \
+                {"Content-Type": "application/xml; charset=utf-8"}
+        if event == "unsubscribe":
+            record_unsubscribe(user_hash)
+            return "", 200
+        log("忽略事件消息：", event)
+        return "", 200
     if msg["msg_type"] != "text":
         log("忽略非文本消息：", msg["msg_type"])
         return "", 200
     question = msg["content"]
-    user_hash = _user_hash(msg["from_user"])
     log("收到提问 user=", user_hash, "len=", len(question))
     if is_help_command(question):
         answer = HELP_TEXT
     elif not question:
         answer = HELP_TEXT
     else:
-        answer = answer_question(question, INDEX, user_hash=user_hash)
+        # openid 传给后台任务：推送开启时客服消息要靠它找人；只放内存、不记日志。
+        answer = answer_question(question, INDEX, user_hash=user_hash,
+                                 openid=msg["from_user"])
     return build_text_reply(msg["from_user"], msg["to_user"], answer), 200, \
         {"Content-Type": "application/xml; charset=utf-8"}
 
@@ -667,6 +966,21 @@ def admin_reload():
     return {"status": "ok", "docs": docs, "chunks": chunks}
 
 
+@app.route("/admin/unlock", methods=["POST"])
+def admin_unlock():
+    """v1.4 手动解锁：转发 5 篇文章微信没法自动核实，用户拿截图等凭证
+    找管理员时，管理员调这个接口提前解锁。Body {"openid": "..."}，
+    鉴权头 X-Admin-Token，和 /admin/reload 同一个 ADMIN_TOKEN。"""
+    if not ADMIN_TOKEN or request.headers.get("X-Admin-Token", "") != ADMIN_TOKEN:
+        return {"error": "unauthorized"}, 401
+    body = request.get_json(silent=True) or {}
+    openid = (body.get("openid") or "").strip()
+    if not openid:
+        return {"error": "openid required"}, 400
+    user_hash = unlock_user(openid)
+    return {"status": "ok", "user": user_hash, "unlocked": True}
+
+
 if __name__ == "__main__":
     _mode, _model, _models_info = _llm_startup_info()
     if _mode == "fixed":
@@ -674,10 +988,13 @@ if __name__ == "__main__":
     else:
         _llm_log = (f"LLM=auto({_model})@{LLM_API_BASE}，"
                     f"{_models_info or 'models=discovery failed'}")
+    _push_log = ("客服推送=已开启" if push_enabled()
+                 else "客服推送=未开启（未配 MP_APPID/MP_APPSECRET，"
+                      "慢回答需发“继续”取）")
     log(f"公众号 RAG 机器人 v{VERSION} 启动：监听 0.0.0.0:{PORT}，"
         f"知识库 {INDEX.stats()}，{_llm_log}，"
         f"首答等待 {_first_wait_sec()}s，总预算 {LLM_TIMEOUT_SEC}s，"
-        f"上限 {LLM_MAX_TOKENS} tokens，"
+        f"上限 {LLM_MAX_TOKENS} tokens，{_push_log}，"
         f"MP_TOKEN={'已配置' if MP_TOKEN else '未配置'}，"
         f"LLM_API_KEY={'已配置' if LLM_API_KEY else '未配置'}")
     app.run(host="0.0.0.0", port=PORT)
