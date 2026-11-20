@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""公众号轻量 RAG 机器人 v1.3。
+"""公众号轻量 RAG 机器人 v1.3.1。
 
 服务号（未微信认证）发文字消息 -> 微信 POST 到 /mp/callback ->
 检索 knowledge/ 里的 Markdown 作参考 -> 调用户自配的大模型综合回答 ->
@@ -21,7 +21,7 @@
 异步查询（v1.3）：大模型慢（muse2api 实测经常超过 4 秒）时，不能傻等，
 因为微信被动回复必须在 5 秒内到，超时粉丝什么都收不到。所以问答分
 两步：先在后台线程调大模型，主请求只等 LLM_FIRST_WAIT_SEC（默认 4 秒）；
-等到了直接回答案，等不到先回一句“正在查询，请稍等…”，后台继续跑到
+等到了直接回答案，等不到先回一句“请稍等，查询中。。。”，后台继续跑到
 LLM_TIMEOUT_SEC（默认 20 秒），结果缓存在内存里，粉丝再发“继续”或重发
 同样的问题就能拿到答案。未认证的号没有客服消息，机器人不能主动再推
 一条消息，只能等粉丝再发一条消息来取结果——这是这个号能做到的上限，
@@ -50,7 +50,7 @@ from flask import Flask, request
 
 from retrieval import KnowledgeIndex
 
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 PORT = int(os.environ.get("MP_PORT", "18790"))
 KNOWLEDGE_DIR = os.environ.get(
     "KNOWLEDGE_DIR",
@@ -128,8 +128,8 @@ LLM_UNAVAILABLE_TEXT = "大模型暂时不可用，请稍后再问。"
 HELP_COMMANDS = {"帮助", "help", "菜单", "menu", "/help", "/menu", "你好", "hi", "hello"}
 
 # v1.3 异步查询：占位提示与“继续”取结果。
-# 注意占位提示里写的是总预算秒数（默认 20 秒），由 _placeholder_text() 按
-# 当前 LLM_TIMEOUT_SEC 动态生成，改了超时配置提示里的数字也会跟着变。
+# 占位提示（v1.3.1）：第一行固定为用户要的“请稍等，查询中。。。”，
+# 第二行只留一句取结果的提示，两行，不写秒数。
 STILL_WAITING_TEXT = "还在查询，请再等一下，稍后再发“继续”。"
 CONTINUE_COMMANDS = {"继续", "继续查询", "好了吗", "好了么", "结果", "查看结果", "继续查"}
 # 每个用户同时只保留一个查询任务：{user_hash: job}，内存保存，不写文件、
@@ -142,11 +142,7 @@ _JOBS_LOCK = threading.Lock()
 
 
 def _placeholder_text():
-    return (
-        "正在查询，请稍等…\n"
-        f"（大模型正在回答，约{int(LLM_TIMEOUT_SEC)}秒内出结果，"
-        "稍后发“继续”或再发一次同样的问题查看结果）"
-    )
+    return "请稍等，查询中。。。\n（稍后发“继续”查看结果）"
 
 
 def _first_wait_sec():
@@ -553,7 +549,7 @@ def answer_question(question, index, user_hash="anon"):
 
     快路径：大模型在 LLM_FIRST_WAIT_SEC（默认 4 秒）内回完，直接回答案，
     和 v1.2 一样；任务随即清除，之后再发“继续”只会回帮助。
-    慢路径：4 秒没回完，先回占位提示“正在查询，请稍等…”，后台继续跑到
+    慢路径：4 秒没回完，先回占位提示“请稍等，查询中。。。”，后台继续跑到
     LLM_TIMEOUT_SEC（默认 20 秒）；结果缓存 10 分钟，粉丝发“继续”或重发
     同样的问题来取。重发同样的问题、且任务还在跑时不重复开任务。
     “继续”类命令：有已完成的任务就取走答案并清除；还在跑就回“还在查询”；
