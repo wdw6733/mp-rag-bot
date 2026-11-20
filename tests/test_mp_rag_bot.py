@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""公众号 RAG 机器人 v1.4.0 测试。
+"""公众号 RAG 机器人 v1.4.1 测试。
 
 只测本地逻辑，不连微信、不连真实 LLM、不读真实 NAS：
 LLM 和微信接口的 HTTP 调用全部 mock，知识库用仓库里真实的 7 篇种子文档。
@@ -402,7 +402,7 @@ def test_help_text_mentions_llm_primary():
 
 
 def test_version_is_1_4():
-    assert mpb.VERSION == "1.4.0"
+    assert mpb.VERSION == "1.4.1"
     assert mpb.MAX_ANSWER_CHARS == 1000
     assert mpb.LLM_TIMEOUT_SEC == 20
     assert mpb.LLM_FIRST_WAIT_SEC == 4
@@ -416,7 +416,7 @@ def test_health(client):
     assert r.status_code == 200
     data = r.get_json()
     assert data["status"] == "ok"
-    assert data["version"] == "1.4.0"
+    assert data["version"] == "1.4.1"
     assert data["docs"] == 7
     assert data["chunks"] >= 28
     assert data["llm_mode"] == "auto"
@@ -794,11 +794,11 @@ def _post_text(client, content, from_user="user_openid_abc"):
 
 
 def test_placeholder_text():
+    # v1.4.1：占位提示永远只有一行，不写第二行、不提“继续”
     text = mpb._placeholder_text()
-    assert text == "请稍等，查询中。。。\n（稍后发“继续”查看结果）"
-    assert text.startswith("请稍等，查询中。。。")
-    assert "继续" in text
-    assert text.count("\n") == 1  # 两行，不写秒数
+    assert text == "请稍等，查询中。。。"
+    assert "继续" not in text
+    assert "\n" not in text
 
 
 def test_placeholder_does_not_depend_on_timeout(monkeypatch, index):
@@ -1075,8 +1075,18 @@ def test_placeholder_push_mode_no_continue_hint(monkeypatch):
     assert "\n" not in text  # 推送开启时只有一行，粉丝只管等
 
 
-def test_placeholder_no_push_has_continue_hint():
-    assert mpb._placeholder_text() == "请稍等，查询中。。。\n（稍后发“继续”查看结果）"
+def test_placeholder_no_push_single_line_too():
+    # v1.4.1：没开启推送时占位也只有一行，不再写“稍后发‘继续’查看结果”
+    assert mpb.push_enabled() is False
+    assert mpb._placeholder_text() == "请稍等，查询中。。。"
+
+
+def test_placeholder_never_mentions_continue(monkeypatch):
+    # v1.4.1：两种模式下占位里都没有“继续”二字
+    assert "继续" not in mpb._placeholder_text()
+    _enable_push(monkeypatch)
+    assert "继续" not in mpb._placeholder_text()
+    assert mpb._placeholder_text() == "请稍等，查询中。。。"
 
 
 def test_get_access_token_caches(monkeypatch):
